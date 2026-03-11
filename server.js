@@ -62,7 +62,7 @@ app.get('/tickets', function(req, res) {
   request.end();
 });
 
-var PORT = process.env.PORT || 3000;
+var PORT = process.env.PORT || 8080;
 app.listen(PORT, function() {
   console.log('Jira proxy running on port ' + PORT);
 });
