@@ -38,16 +38,20 @@ app.get('/tickets', function(req, res) {
           return res.status(500).json({ error: 'No issues found', raw: data });
         }
         var tickets = data.issues.map(function(issue) {
-          var desc = 'No description';
-          try {
-            desc = issue.fields.description.content[0].content[0].text;
-          } catch(e) {}
-          return {
-            id: issue.key,
-            title: issue.fields.summary,
-            description: desc
-          };
-        });
+            var desc = 'No description';
+            var title = 'No title';
+            try {
+              title = issue.fields && issue.fields.summary ? issue.fields.summary : 'No title';
+            } catch(e) {}
+            try {
+              desc = issue.fields.description.content[0].content[0].text;
+            } catch(e) {}
+            return {
+              id: issue.key,
+              title: title,
+              description: desc
+            };
+          });
         res.json({ tickets: tickets });
       } catch(e) {
         res.status(500).json({ error: e.message });
