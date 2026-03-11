@@ -16,7 +16,7 @@ app.get('/tickets', function(req, res) {
   }
 
   var auth = Buffer.from(email + ':' + token).toString('base64');
-  var urlObj = new URL(jiraUrl + '/rest/api/3/search?jql=assignee=currentUser()&maxResults=20');
+  var urlObj = new URL(jiraUrl + '/rest/api/3/search/jql?jql=assignee=currentUser()&maxResults=20');
 
   var options = {
     hostname: urlObj.hostname,
