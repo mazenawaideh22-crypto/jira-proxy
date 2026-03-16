@@ -11,7 +11,7 @@ app.use(express.json());
 const CLIENT_ID = process.env.ATLASSIAN_CLIENT_ID;
 const CLIENT_SECRET = process.env.ATLASSIAN_CLIENT_SECRET;
 const REDIRECT_URI = 'https://jira-proxy-production-ec4e.up.railway.app/auth/callback';
-const SCOPES = 'read:jira-work write:jira-work read:me offline_access';
+const SCOPES = 'read:jira-work write:jira-work read:jira-user offline_access';
 
 // In-memory store for codes (expires in 5 min)
 var pendingCodes = {};
