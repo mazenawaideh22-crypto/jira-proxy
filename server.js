@@ -1,9 +1,8 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const crypto = require('crypto');
-
-require('dotenv').config();
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -12,25 +11,28 @@ app.use(express.json());
 const CLIENT_ID = process.env.ATLASSIAN_CLIENT_ID;
 const CLIENT_SECRET = process.env.ATLASSIAN_CLIENT_SECRET;
 const REDIRECT_URI = 'https://jira-proxy-production-ec4e.up.railway.app/auth/callback';
+const SCOPES = 'read:jira-work write:jira-work read:me offline_access';
 
-// Store temporary codes in memory
-// { code: { accessToken, cloudId, expiresAt } }
-var tokenStore = {};
+// In-memory store for codes (expires in 5 min)
+var pendingCodes = {};
 
-function cleanExpired() {
+function cleanup() {
   var now = Date.now();
-  Object.keys(tokenStore).forEach(function(k) {
-    if (tokenStore[k].expiresAt < now) delete tokenStore[k];
+  Object.keys(pendingCodes).forEach(function(code) {
+    if (pendingCodes[code].expiresAt < now) {
+      delete pendingCodes[code];
+    }
   });
 }
+setInterval(cleanup, 60000);
 
-// ── Step 1: Start OAuth flow ──
+// ── AUTH: Redirect to Atlassian ──
 app.get('/auth/jira', function(req, res) {
   var state = crypto.randomBytes(16).toString('hex');
   var url = 'https://auth.atlassian.com/authorize' +
     '?audience=api.atlassian.com' +
     '&client_id=' + CLIENT_ID +
-    '&scope=read%3Ajira-work%20write%3Ajira-work%20read%3Ajira-user%20offline_access' +
+    '&scope=' + encodeURIComponent(SCOPES) +
     '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
     '&state=' + state +
     '&response_type=code' +
@@ -38,11 +40,14 @@ app.get('/auth/jira', function(req, res) {
   res.redirect(url);
 });
 
-// ── Step 2: Handle callback ──
+// ── AUTH: Callback from Atlassian ──
 app.get('/auth/callback', function(req, res) {
   var code = req.query.code;
-  if (!code) { return res.status(400).send('No code received'); }
+  if (!code) {
+    return res.status(400).send('<h2>Error: No code returned from Atlassian</h2>');
+  }
 
+  // Exchange code for token
   var body = JSON.stringify({
     grant_type: 'authorization_code',
     client_id: CLIENT_ID,
@@ -68,95 +73,126 @@ app.get('/auth/callback', function(req, res) {
       try {
         var tokenData = JSON.parse(data);
         if (!tokenData.access_token) {
-          return res.status(500).send('Failed to get token: ' + data);
+          return res.status(400).send('<h2>Error getting token: ' + JSON.stringify(tokenData) + '</h2>');
         }
 
-        // Get accessible resources (cloud IDs)
-        var resourceOptions = {
+        // Get cloud ID
+        var accessToken = tokenData.access_token;
+        var cloudOptions = {
           hostname: 'api.atlassian.com',
           path: '/oauth/token/accessible-resources',
           method: 'GET',
-          headers: {
-            'Authorization': 'Bearer ' + tokenData.access_token,
-            'Accept': 'application/json'
-          }
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
         };
 
-        var resReq = https.request(resourceOptions, function(resResponse) {
-          var resData = '';
-          resResponse.on('data', function(chunk) { resData += chunk; });
-          resResponse.on('end', function() {
+        var cloudReq = https.request(cloudOptions, function(cloudRes) {
+          var cloudData = '';
+          cloudRes.on('data', function(c) { cloudData += c; });
+          cloudRes.on('end', function() {
             try {
-              var resources = JSON.parse(resData);
-              var cloudId = resources[0] && resources[0].id;
-              var siteName = resources[0] && resources[0].name;
+              var resources = JSON.parse(cloudData);
+              var cloudId = resources[0] ? resources[0].id : null;
+              var jiraUrl = resources[0] ? resources[0].url : null;
 
               // Generate 6-digit code
               var pluginCode = Math.floor(100000 + Math.random() * 900000).toString();
-
-              // Store with 10 min expiry
-              tokenStore[pluginCode] = {
-                accessToken: tokenData.access_token,
+              pendingCodes[pluginCode] = {
+                accessToken: accessToken,
                 refreshToken: tokenData.refresh_token,
                 cloudId: cloudId,
-                siteName: siteName,
-                expiresAt: Date.now() + 10 * 60 * 1000
+                jiraUrl: jiraUrl,
+                expiresAt: Date.now() + 5 * 60 * 1000
               };
 
-              cleanExpired();
-
               // Show success page
-              res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>JiraAI Designer</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0a0a0f;color:#f0f0f5;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#111118;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:40px;text-align:center;max-width:380px}.logo{font-size:40px;margin-bottom:20px}.title{font-size:22px;font-weight:700;margin-bottom:8px}.sub{color:#6b6b80;font-size:14px;margin-bottom:32px}.code-label{font-size:11px;color:#6b6b80;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:10px}.code{font-size:48px;font-weight:800;letter-spacing:0.15em;color:#7c6dfa;background:rgba(124,109,250,0.1);border:2px solid rgba(124,109,250,0.3);border-radius:14px;padding:16px 32px;margin-bottom:16px;font-family:monospace}.hint{font-size:12px;color:#6b6b80;line-height:1.6}.site{color:#4dd98a;font-weight:600}</style></head><body><div class="card"><div class="logo">✦</div><h1 class="title">Connected!</h1><p class="sub">Linked to <span class="site">' + (siteName || 'your Jira') + '</span></p><div class="code-label">Enter this code in the plugin</div><div class="code">' + pluginCode + '</div><p class="hint">This code expires in <strong>10 minutes</strong>.<br>Go back to Figma and enter it.</p></div></body></html>');
-
+              res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>JiraAI Designer — Connected!</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .card { background: #111118; border: 1px solid rgba(255,255,255,0.08); border-radius: 20px; padding: 40px; text-align: center; max-width: 380px; width: 90%; }
+  .icon { font-size: 48px; margin-bottom: 16px; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  p { font-size: 13px; color: #6b6b80; margin-bottom: 24px; line-height: 1.6; }
+  .code-box { background: #1a1a2e; border: 2px solid #6366f1; border-radius: 14px; padding: 20px; margin-bottom: 24px; }
+  .code-label { font-size: 11px; color: #6b6b80; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
+  .code { font-size: 42px; font-weight: 800; letter-spacing: 0.2em; color: #a99fff; font-family: monospace; }
+  .note { font-size: 11px; color: #3a3a4a; }
+  .close-btn { background: #6366f1; color: white; border: none; padding: 12px 32px; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">✅</div>
+  <h1>Connected to Jira!</h1>
+  <p>Enter this code in the JiraAI Designer plugin to complete the connection.</p>
+  <div class="code-box">
+    <div class="code-label">Your Plugin Code</div>
+    <div class="code">` + pluginCode + `</div>
+  </div>
+  <p class="note">This code expires in 5 minutes.</p>
+  <br>
+  <button class="close-btn" onclick="window.close()">Close & Return to Figma</button>
+</div>
+</body>
+</html>`);
             } catch(e) {
-              res.status(500).send('Error parsing resources: ' + e.message);
+              res.status(500).send('<h2>Error: ' + e.message + '</h2>');
             }
           });
         });
-        resReq.on('error', function(e) { res.status(500).send('Resource error: ' + e.message); });
-        resReq.end();
+        cloudReq.on('error', function(e) { res.status(500).send('<h2>Cloud error: ' + e.message + '</h2>'); });
+        cloudReq.end();
 
       } catch(e) {
-        res.status(500).send('Error: ' + e.message);
+        res.status(500).send('<h2>Parse error: ' + e.message + '</h2>');
       }
     });
   });
-
-  request.on('error', function(e) { res.status(500).send('Request error: ' + e.message); });
+  request.on('error', function(e) { res.status(500).send('<h2>Request error: ' + e.message + '</h2>'); });
   request.write(body);
   request.end();
 });
 
-// ── Step 3: Plugin exchanges code for token ──
-app.post('/auth/exchange', function(req, res) {
-  cleanExpired();
-  var code = req.body.code;
-  if (!code || !tokenStore[code]) {
+// ── PLUGIN: Exchange code for token ──
+app.get('/auth/token', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var code = req.query.code;
+  if (!code || !pendingCodes[code]) {
     return res.status(404).json({ error: 'Invalid or expired code' });
   }
-  var data = tokenStore[code];
-  delete tokenStore[code];
+  var data = pendingCodes[code];
+  if (Date.now() > data.expiresAt) {
+    delete pendingCodes[code];
+    return res.status(410).json({ error: 'Code expired' });
+  }
+  delete pendingCodes[code];
   res.json({
     accessToken: data.accessToken,
+    refreshToken: data.refreshToken,
     cloudId: data.cloudId,
-    siteName: data.siteName
+    jiraUrl: data.jiraUrl
   });
 });
 
-// ── Tickets endpoint ──
+// ── TICKETS ──
 app.get('/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
+  var accessToken = req.query.accessToken;
+  var cloudId = req.query.cloudId;
   var jiraUrl = req.query.jiraUrl;
   var email = req.query.email;
   var token = req.query.token;
-  var accessToken = req.query.accessToken;
-  var cloudId = req.query.cloudId;
 
+  var useOAuth = accessToken && cloudId;
   var hostname, path, authHeader;
 
-  if (accessToken && cloudId) {
+  if (useOAuth) {
     hostname = 'api.atlassian.com';
-    path = '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=assignee=currentUser()&maxResults=20&fields=summary,description,status';
+    path = '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=assignee=currentUser()&maxResults=20&fields=summary,description,status,assignee';
     authHeader = 'Bearer ' + accessToken;
   } else {
     if (!jiraUrl || !email || !token) { return res.status(400).json({ error: 'Missing parameters' }); }
@@ -194,20 +230,21 @@ app.get('/tickets', function(req, res) {
   request.end();
 });
 
-// ── Comment endpoint ──
+// ── COMMENT ──
 app.post('/comment', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
+  var accessToken = req.body.accessToken;
+  var cloudId = req.body.cloudId;
   var jiraUrl = req.body.jiraUrl;
   var email = req.body.email;
   var token = req.body.token;
-  var accessToken = req.body.accessToken;
-  var cloudId = req.body.cloudId;
   var ticketId = req.body.ticketId;
   var comment = req.body.comment;
 
+  var useOAuth = accessToken && cloudId;
   var hostname, path, authHeader;
 
-  if (accessToken && cloudId) {
+  if (useOAuth) {
     hostname = 'api.atlassian.com';
     path = '/ex/jira/' + cloudId + '/rest/api/3/issue/' + ticketId + '/comment';
     authHeader = 'Bearer ' + accessToken;
@@ -225,12 +262,7 @@ app.post('/comment', function(req, res) {
     hostname: hostname,
     path: path,
     method: 'POST',
-    headers: {
-      'Authorization': authHeader,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
-    }
+    headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   };
 
   var request = https.request(options, function(response) {
