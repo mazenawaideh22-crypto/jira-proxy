@@ -290,3 +290,10 @@ app.options('*', function(req, res) {
 
 var PORT = process.env.PORT || 8080;
 app.listen(PORT, function() { console.log('Server running on port ' + PORT); });
+
+app.get('/debug', function(req, res) {
+  res.json({
+    clientIdFirst8: process.env.ATLASSIAN_CLIENT_ID ? process.env.ATLASSIAN_CLIENT_ID.substring(0, 8) : 'NOT SET',
+    hasSecret: !!process.env.ATLASSIAN_CLIENT_SECRET
+  });
+});
