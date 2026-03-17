@@ -145,6 +145,31 @@ app.get('/auth/token', function(req, res) {
   res.json(data);
 });
 
+// ── SPACES ──
+app.get('/spaces', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var accessToken = req.query.accessToken;
+  var cloudId = req.query.cloudId;
+  var provider = req.query.provider || 'jira';
+  try {
+    if (provider === 'github') {
+      var ghRes = await httpsRequest({ hostname: 'api.github.com', path: '/user/repos?sort=updated&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'User-Agent': 'Structify', 'Accept': 'application/json' } });
+      var spaces = (ghRes.data || []).map(function(r) { return { id: r.full_name, name: r.full_name }; });
+      return res.json({ spaces: spaces });
+    }
+    if (provider === 'linear') {
+      var query = JSON.stringify({ query: '{ teams { nodes { id name } } }' });
+      var linRes = await httpsRequest({ hostname: 'api.linear.app', path: '/graphql', method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(query) } }, query);
+      var nodes = linRes.data.data ? linRes.data.data.teams.nodes : [];
+      return res.json({ spaces: nodes.map(function(t) { return { id: t.id, name: t.name }; }) });
+    }
+    // Jira projects
+    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+    var projects = (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; });
+    res.json({ spaces: projects });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── TICKETS ──
 app.get('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
