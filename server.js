@@ -170,6 +170,22 @@ app.get('/spaces', async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── DEBUG SPACES ──
+app.get('/debug-spaces', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var accessToken = req.query.accessToken;
+  var cloudId = req.query.cloudId;
+  try {
+    var jiraRes = await httpsRequest({
+      hostname: 'api.atlassian.com',
+      path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50',
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+    });
+    res.json({ status: jiraRes.status, data: jiraRes.data });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── TICKETS ──
 app.get('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
