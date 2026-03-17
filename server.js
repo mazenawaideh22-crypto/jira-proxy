@@ -209,7 +209,9 @@ app.get('/tickets', async function(req, res) {
       return res.json({ tickets: tickets });
     }
     // Jira
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC&maxResults=30&fields=summary,description,status', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+    var spaceId = req.query.spaceId;
+    var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
+    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql + '&maxResults=30&fields=summary,description,status', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     if (!jiraRes.data.issues) return res.status(500).json({ error: 'No issues', raw: jiraRes.data });
     var tickets = jiraRes.data.issues.map(function(issue) {
       var desc = 'No description';
