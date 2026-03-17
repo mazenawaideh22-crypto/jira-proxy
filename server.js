@@ -255,13 +255,14 @@ app.post('/analyze', async function(req, res) {
   var body = JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 8000, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] });
 
   try {
+    if (!CLAUDE_API_KEY) return res.status(500).json({ error: 'Claude API key not configured' });
     var claudeRes = await httpsRequest({
       hostname: 'api.anthropic.com',
       path: '/v1/messages',
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) }
     }, body);
-    if (claudeRes.status !== 200) return res.status(claudeRes.status).json({ error: claudeRes.data });
+    if (claudeRes.status !== 200) return res.status(500).json({ error: 'Claude returned ' + claudeRes.status, details: claudeRes.data });
     var rawText = claudeRes.data.content[0].text;
     rawText = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
     var start = rawText.indexOf('{');
@@ -269,7 +270,7 @@ app.post('/analyze', async function(req, res) {
     if (start !== -1 && end !== -1) rawText = rawText.substring(start, end + 1);
     var plan = JSON.parse(rawText);
     res.json({ plan: plan });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.status(500).json({ error: e.message, stack: e.stack }); }
 });
 
 // ── COMMENT ──
