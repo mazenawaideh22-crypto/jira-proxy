@@ -117,7 +117,7 @@ app.get('/auth/linear', function(req, res) {
     '?client_id=' + LINEAR_CLIENT_ID +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/linear/callback') +
     '&response_type=code' +
-    '&scope=read,write' +
+    '&scope=' + encodeURIComponent('read,write') +
     '&state=' + crypto.randomBytes(16).toString('hex');
   res.redirect(url);
 });
