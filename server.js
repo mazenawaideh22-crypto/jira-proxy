@@ -128,7 +128,7 @@ app.get('/auth/linear/callback', async function(req, res) {
   try {
     var body = JSON.stringify({ client_id: LINEAR_CLIENT_ID, client_secret: LINEAR_CLIENT_SECRET, code: code, redirect_uri: BASE_URL + '/auth/linear/callback', grant_type: 'authorization_code' });
     var tokenRes = await httpsRequest({ hostname: 'api.linear.app', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, body);
-    if (!tokenRes.data.access_token) return res.status(400).send('<h2>Linear token error</h2>');
+    if (!tokenRes.data.access_token) return res.status(400).send('<h2>Linear token error: ' + JSON.stringify(tokenRes.data) + '</h2>');
     var pluginCode = generateCode({ provider: 'linear', accessToken: tokenRes.data.access_token });
     res.send(successPage(pluginCode, 'Linear'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
