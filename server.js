@@ -4,7 +4,7 @@ const cors = require('cors');
 const https = require('https');
 const crypto = require('crypto');
 const path = require('path');
-const rateLimit = require('express-rate-limit');
+const rateLimit = null; // replaced with custom rateLimiter()
 const helmet = require('helmet');
 
 const app = express();
@@ -19,23 +19,44 @@ app.use(helmet({
 }));
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
-// Keyed by userId from request body (more reliable than IP behind Railway's proxy)
-// Falls back to IP if no userId present
-function _rlKey(req) {
-  return (req.body && req.body.userId) ? 'uid:' + req.body.userId : (req.ip || 'unknown');
-}
-var _rlBase = {
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
-  keyGenerator: _rlKey
+// Simple in-memory rate limiter keyed by userId or IP.
+// Runs AFTER body parsing so req.body.userId is available.
+// Resets every 60 seconds per key.
+var _rateCounts = {}; // key -> { count, resetAt }
+var RATE_LIMITS = {
+  '/analyze':          10,
+  '/chat':             30,
+  '/auth/token':       20,
+  '/generate-comment': 20,
+  '/auth/jira':        10,
+  '/auth/gitlab':      10
 };
-app.use('/analyze',          rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10, message: { error: 'Too many requests, slow down.' } })));
-app.use('/chat',             rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 30 })));
-app.use('/auth/token',       rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 20 })));
-app.use('/auth/jira',        rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10 })));
-app.use('/auth/gitlab',      rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10 })));
-app.use('/generate-comment', rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 20 })));
+
+function rateLimiter(maxPerMinute) {
+  return function(req, res, next) {
+    var key = (req.body && req.body.userId)
+      ? 'uid:' + req.body.userId
+      : (req.headers['x-forwarded-for'] || req.ip || 'unknown');
+    var now = Date.now();
+    if (!_rateCounts[key] || now > _rateCounts[key].resetAt) {
+      _rateCounts[key] = { count: 0, resetAt: now + 60000 };
+    }
+    _rateCounts[key].count++;
+    if (_rateCounts[key].count > maxPerMinute) {
+      res.setHeader('Retry-After', Math.ceil((_rateCounts[key].resetAt - now) / 1000));
+      return res.status(429).json({ error: 'Too many requests — slow down.' });
+    }
+    next();
+  };
+}
+
+// Clean up expired keys every 5 minutes
+setInterval(function() {
+  var now = Date.now();
+  Object.keys(_rateCounts).forEach(function(k) {
+    if (now > _rateCounts[k].resetAt) delete _rateCounts[k];
+  });
+}, 5 * 60 * 1000);
 
 // IMPORTANT: Raw body parser MUST come before express.json()
 // Paddle webhook needs the raw body for signature verification
@@ -737,7 +758,7 @@ setInterval(function() {
 }, 60000);
 
 // ─── JIRA AUTH ───────────────────────────────────────────────────────────────
-app.get('/auth/jira', async function(req, res) {
+app.get('/auth/jira', rateLimiter(10), async function(req, res) {
   var state = crypto.randomBytes(16).toString('hex');
   pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
   var url = 'https://auth.atlassian.com/authorize' +
@@ -771,7 +792,7 @@ app.get('/auth/jira/callback', async function(req, res) {
 });
 
 // ─── GITLAB AUTH ─────────────────────────────────────────────────────────────
-app.get('/auth/gitlab', async function(req, res) {
+app.get('/auth/gitlab', rateLimiter(10), async function(req, res) {
   var state = crypto.randomBytes(16).toString('hex');
   pendingStates[state] = { provider: 'gitlab', createdAt: Date.now() };
   var url = 'https://gitlab.com/oauth/authorize' +
@@ -806,7 +827,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
 });
 
 // ─── AUTH TOKEN EXCHANGE ─────────────────────────────────────────────────────
-app.get('/auth/token', async function(req, res) {
+app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
   if (!code || !pendingCodes[code]) return res.status(404).json({ error: 'Invalid or expired code' });
@@ -901,7 +922,7 @@ app.post('/tickets', async function(req, res) {
 });
 
 // ─── CHAT ────────────────────────────────────────────────────────────────────
-app.post('/chat', async function(req, res) {
+app.post('/chat', rateLimiter(30), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   if (!CLAUDE_API_KEY) return res.json({ text: 'API key not configured.', intent: 'none', suggestion: '', target: '' });
   var message     = req.body.message    || '';
@@ -993,7 +1014,7 @@ app.post('/test-connection', async function(req, res) {
 });
 
 // ─── ANALYZE ─────────────────────────────────────────────────────────────────
-app.post('/analyze', async function(req, res) {
+app.post('/analyze', rateLimiter(10), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   req.socket.setTimeout(120000);
   res.setTimeout(120000);
@@ -1102,7 +1123,7 @@ app.post('/analyze', async function(req, res) {
 });
 
 // ─── GENERATE COMMENT (AI handoff comment — does NOT count as a generation) ──
-app.post('/generate-comment', async function(req, res) {
+app.post('/generate-comment', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var prompt = req.body.prompt || '';
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
