@@ -22,7 +22,6 @@ app.use(helmet({
 // Runs AFTER body parsing so req.body.userId is available.
 // Resets every 60 seconds per key.
 var _rateCounts = {}; // key -> { count, resetAt }
-
 function rateLimiter(maxPerMinute) {
   return function(req, res, next) {
     var key = (req.body && req.body.userId)
@@ -386,13 +385,33 @@ function httpsRequest(options, body) {
   });
 }
 
+// ─── INPUT VALIDATION ────────────────────────────────────────────────────────
+// userId must be a non-empty string under 128 chars — prevents SQL injection
+// attempts and oversized inputs from reaching the database
+function isValidUserId(userId) {
+  return typeof userId === 'string' &&
+    userId.length > 0 &&
+    userId.length <= 128 &&
+    /^[a-zA-Z0-9_\-:.@]+$/.test(userId);
+}
+
+function requireUserId(req, res) {
+  var userId = (req.body && req.body.userId) || (req.query && req.query.userId);
+  if (!userId || !isValidUserId(userId)) {
+    res.status(400).json({ error: 'Invalid or missing userId' });
+    return null;
+  }
+  return userId;
+}
+
 // ─── USAGE ENDPOINT ──────────────────────────────────────────────────────────
 var PLAN_LIMITS = { pro: 15, business: 40, enterprise: 25 };
 var PLAN_SEATS  = { pro: 1, business: 1, enterprise: 5 };
 
 app.get('/usage', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.query.userId;
+  var userId = requireUserId(req, res);
+  if (!userId) return;
   var isDev  = DEVELOPER_IDS.includes(userId);
   try {
     var paid   = await getUser(userId);
@@ -429,8 +448,8 @@ app.get('/usage', async function(req, res) {
 // ─── CHECK PAID STATUS ───────────────────────────────────────────────────────
 app.get('/check-paid', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.query.userId;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
+  var userId = requireUserId(req, res);
+  if (!userId) return;
   var isDev  = DEVELOPER_IDS.includes(userId);
   try {
     var paid   = await getUser(userId);
@@ -616,11 +635,12 @@ app.post('/paddle/webhook', async function(req, res) {
 // ─── UPGRADE (carry-over) ────────────────────────────────────────────────────
 app.post('/paddle/upgrade', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId  = req.body.userId;
+  var userId  = requireUserId(req, res);
+  if (!userId) return;
   var newPlan = req.body.newPlan;
   var newType = req.body.newType || 'structify';
   var seats   = parseInt(req.body.seats) || 1;
-  if (!userId || !newPlan) return res.status(400).json({ error: 'userId and newPlan required' });
+  if (!newPlan) return res.status(400).json({ error: 'newPlan required' });
   try {
     var paid      = await getUser(userId) || {};
     var oldPlan   = paid.plan || null;
@@ -639,8 +659,8 @@ app.post('/paddle/upgrade', async function(req, res) {
 // GET /team/code?userId=XXX  — returns the owner's team code + member list
 app.get('/team/code', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.query.userId;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
+  var userId = requireUserId(req, res);
+  if (!userId) return;
   try {
     var paid = await getUser(userId);
     if (!paid || paid.plan !== 'enterprise') return res.status(403).json({ error: 'Enterprise plan required' });
@@ -659,9 +679,10 @@ app.get('/team/code', async function(req, res) {
 // POST /team/join  { userId, teamCode }  — member joins an enterprise team
 app.post('/team/join', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId   = req.body.userId;
+  var userId   = requireUserId(req, res);
+  if (!userId) return;
   var teamCode = (req.body.teamCode || '').toUpperCase().trim();
-  if (!userId || !teamCode) return res.status(400).json({ error: 'userId and teamCode required' });
+  if (!teamCode) return res.status(400).json({ error: 'teamCode required' });
 
   try {
     var ownerRow = await pool.query('SELECT * FROM users WHERE team_code = $1 LIMIT 1', [teamCode]);
@@ -690,8 +711,8 @@ app.post('/team/join', async function(req, res) {
 // POST /team/leave  { userId }  — member leaves a team
 app.post('/team/leave', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.body.userId;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
+  var userId = requireUserId(req, res);
+  if (!userId) return;
   try {
     var paid = await getUser(userId);
     if (!paid || !paid.team_member_of) return res.status(400).json({ error: 'Not a team member' });
@@ -1000,7 +1021,8 @@ app.post('/analyze', rateLimiter(10), async function(req, res) {
   req.socket.setTimeout(120000);
   res.setTimeout(120000);
 
-  var userId = req.body.userId;
+  var userId = requireUserId(req, res);
+  if (!userId) return;
   var isDev  = DEVELOPER_IDS.includes(userId);
 
   var paidRecord = await getUser(userId);
@@ -1159,8 +1181,8 @@ app.post('/comment', async function(req, res) {
 // The subscription.cancelled webhook sets accessUntil so user keeps access until period ends.
 app.post('/paddle/cancel', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.body.userId;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
+  var userId = requireUserId(req, res);
+  if (!userId) return;
 
   var paid = await getUser(userId);
   if (!paid) return res.status(400).json({ error: 'No active subscription found' });
