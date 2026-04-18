@@ -4,8 +4,29 @@ const cors = require('cors');
 const https = require('https');
 const crypto = require('crypto');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 
 const app = express();
+
+// ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: false, // Disabled — Paddle.js loads from CDN
+  crossOriginEmbedderPolicy: false
+}));
+
+// ─── RATE LIMITING ────────────────────────────────────────────────────────────
+// /analyze: max 10 requests per minute per IP (prevents Claude API cost abuse)
+app.use('/analyze', rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, slow down.' } }));
+// /chat: max 30 per minute per IP
+app.use('/chat', rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false }));
+// /auth/token: max 20 per minute per IP (prevents brute-force on 6-digit codes)
+app.use('/auth/token', rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
+// /auth/jira and /auth/gitlab: max 10 per minute per IP
+app.use('/auth/jira', rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false }));
+app.use('/auth/gitlab', rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false }));
+// /generate-comment: max 20 per minute per IP
+app.use('/generate-comment', rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
 
 // IMPORTANT: Raw body parser MUST come before express.json()
 // Paddle webhook needs the raw body for signature verification
@@ -48,57 +69,234 @@ const BASE_URL             = 'https://jira-proxy-production-ec4e.up.railway.app'
 const PADDLE_WEBHOOK_SECRET = process.env.PADDLE_WEBHOOK_SECRET || '';
 const PADDLE_ENV            = process.env.PADDLE_ENV || 'sandbox';
 
-// Hardcoded price IDs (sandbox) — swap for live IDs when going to production
+// Price IDs loaded from env vars — set these in Railway for both sandbox and live.
+// Sandbox vars:  PADDLE_PRICE_STRUCTIFY_PRO, PADDLE_PRICE_STRUCTIFY_BUS, etc.
+// When going live: update the same env vars to your live price IDs — no code change needed.
 const PADDLE_PRICES = {
   structify: {
-    pro:        'pri_01knyef6jehzp54m8jzxg5jsyq',
-    business:   'pri_01knyehb9cma5x9sdbth6rqsyz',
-    enterprise: 'pri_01knyembbkrk5zr1p48ye31z6m'
+    pro:        process.env.PADDLE_PRICE_STRUCTIFY_PRO        || 'pri_01knyef6jehzp54m8jzxg5jsyq',
+    business:   process.env.PADDLE_PRICE_STRUCTIFY_BUS        || 'pri_01knyehb9cma5x9sdbth6rqsyz',
+    enterprise: process.env.PADDLE_PRICE_STRUCTIFY_ENT        || 'pri_01knyembbkrk5zr1p48ye31z6m'
   },
   byok: {
-    pro:        'pri_01knyeqsqktpsk8vw794vk6wjy',
-    business:   'pri_01knyervp1edd4h68nsgg7fs3d',
-    enterprise: 'pri_01knyesx3pqrzcr0hbrczsev6w'
+    pro:        process.env.PADDLE_PRICE_BYOK_PRO             || 'pri_01knyeqsqktpsk8vw794vk6wjy',
+    business:   process.env.PADDLE_PRICE_BYOK_BUS             || 'pri_01knyervp1edd4h68nsgg7fs3d',
+    enterprise: process.env.PADDLE_PRICE_BYOK_ENT             || 'pri_01knyesx3pqrzcr0hbrczsev6w'
   }
 };
 
 // ─── STORES ──────────────────────────────────────────────────────────────────
 var pendingCodes = {};
-const DEVELOPER_IDS = [];
+var DEVELOPER_IDS = (process.env.DEVELOPER_IDS || '').split(',').map(function(s){ return s.trim(); }).filter(Boolean);
 const FREE_LIMIT = 3;
 
-// ─── PERSISTENT FILE STORE ───────────────────────────────────────────────────
-const fs = require('fs');
-const STORE_FILE = path.join(__dirname, 'store.json');
+// ─── POSTGRESQL DATABASE ──────────────────────────────────────────────────────
+// Railway: add the PostgreSQL plugin → DATABASE_URL is set automatically.
+// Schema is created on first boot via initDB().
+const { Pool } = require('pg');
 
-function loadStore() {
-  try {
-    if (fs.existsSync(STORE_FILE)) {
-      var raw = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
-      console.log('[STORE] Loaded. users=' + Object.keys(raw.usageStore || {}).length + ' paid=' + Object.keys(raw.paidUsers || {}).length);
-      return raw;
-    }
-  } catch(e) { console.error('[STORE] Load error:', e.message); }
-  return { usageStore: {}, paidUsers: {} };
+var pool = null;
+
+async function initDB() {
+  var url = process.env.DATABASE_URL || '';
+  if (!url) {
+    console.error('[DB] No DATABASE_URL set. Add the PostgreSQL plugin in Railway.');
+    process.exit(1);
+  }
+  pool = new Pool({
+    connectionString: url,
+    ssl: { rejectUnauthorized: false }   // Required for Railway Postgres
+  });
+
+  // Test connection
+  var client = await pool.connect();
+  console.log('[DB] PostgreSQL connected');
+
+  // Create tables if they don't exist
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id          TEXT PRIMARY KEY,
+      plan             TEXT,
+      plan_type        TEXT,
+      seats            INT DEFAULT 1,
+      paid_at          BIGINT,
+      subscription_id  TEXT,
+      cancelled_at     BIGINT,
+      access_until     BIGINT,
+      bonus_generations INT DEFAULT 0,
+      team_code        TEXT,
+      team_owner       TEXT,
+      team_member_of   TEXT,
+      pending_upgrade  JSONB,
+      created_at       TIMESTAMP DEFAULT NOW(),
+      updated_at       TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS usage (
+      user_id    TEXT PRIMARY KEY,
+      count      INT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS generations (
+      id           SERIAL PRIMARY KEY,
+      user_id      TEXT,
+      billing_user TEXT,
+      ticket_id    TEXT,
+      ticket_title TEXT,
+      plan         TEXT,
+      plan_type    TEXT,
+      industry     TEXT,
+      device_type  TEXT,
+      created_at   TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS team_members (
+      owner_id   TEXT,
+      member_id  TEXT,
+      joined_at  TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (owner_id, member_id)
+    )
+  `);
+
+  // Indexes for common queries
+  await client.query('CREATE INDEX IF NOT EXISTS idx_users_plan ON users(plan)');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at)');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_users_team_code ON users(team_code)');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_users_team_member_of ON users(team_member_of)');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_generations_user ON generations(user_id)');
+  await client.query('CREATE INDEX IF NOT EXISTS idx_generations_created ON generations(created_at)');
+
+  client.release();
+  console.log('[DB] Tables ready');
 }
 
-function saveStore() {
-  try {
-    fs.writeFileSync(STORE_FILE, JSON.stringify({ usageStore: usageStore, paidUsers: paidUsers }, null, 2));
-  } catch(e) { console.error('[STORE] Save error:', e.message); }
+// ─── DB HELPER FUNCTIONS ──────────────────────────────────────────────────────
+
+async function getUser(userId) {
+  var r = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+  return r.rows[0] || null;
 }
 
-var _store    = loadStore();
-var usageStore = _store.usageStore || {};  // userId -> number of free uses
-var paidUsers  = _store.paidUsers  || {};  // userId -> { plan, type, seats, paidAt }
+async function getUsage(userId) {
+  var r = await pool.query('SELECT count FROM usage WHERE user_id = $1', [userId]);
+  return r.rows[0] ? r.rows[0].count : 0;
+}
+
+async function setUsage(userId, count) {
+  await pool.query(
+    'INSERT INTO usage (user_id, count, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (user_id) DO UPDATE SET count = $2, updated_at = NOW()',
+    [userId, count]
+  );
+}
+
+async function incrementUsage(userId) {
+  var r = await pool.query(
+    'INSERT INTO usage (user_id, count, updated_at) VALUES ($1, 1, NOW()) ON CONFLICT (user_id) DO UPDATE SET count = usage.count + 1, updated_at = NOW() RETURNING count',
+    [userId]
+  );
+  return r.rows[0].count;
+}
+
+async function saveUser(userId, data) {
+  await pool.query(
+    `INSERT INTO users (user_id, plan, plan_type, seats, paid_at, subscription_id,
+      cancelled_at, access_until, bonus_generations, team_code, team_owner,
+      team_member_of, pending_upgrade, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+     ON CONFLICT (user_id) DO UPDATE SET
+       plan=$2, plan_type=$3, seats=$4, paid_at=$5, subscription_id=$6,
+       cancelled_at=$7, access_until=$8, bonus_generations=$9,
+       team_code=$10, team_owner=$11, team_member_of=$12,
+       pending_upgrade=$13, updated_at=NOW()`,
+    [
+      userId,
+      data.plan || null,
+      data.type || data.plan_type || null,
+      data.seats || 1,
+      data.paidAt || data.paid_at || null,
+      data.subscriptionId || data.subscription_id || null,
+      data.cancelledAt || data.cancelled_at || null,
+      data.accessUntil || data.access_until || null,
+      data.bonusGenerations || data.bonus_generations || 0,
+      data.teamCode || data.team_code || null,
+      data.teamOwner || data.team_owner || null,
+      data.teamMemberOf || data.team_member_of || null,
+      data.pendingUpgrade ? JSON.stringify(data.pendingUpgrade) : null
+    ]
+  );
+}
+
+async function deleteUser(userId) {
+  await pool.query('DELETE FROM users WHERE user_id = $1', [userId]);
+  // Keep usage record for audit
+}
+
+async function getTeamMembers(ownerId) {
+  var r = await pool.query('SELECT member_id FROM team_members WHERE owner_id = $1', [ownerId]);
+  return r.rows.map(function(row) { return row.member_id; });
+}
+
+async function addTeamMember(ownerId, memberId) {
+  await pool.query(
+    'INSERT INTO team_members (owner_id, member_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+    [ownerId, memberId]
+  );
+}
+
+async function removeTeamMember(ownerId, memberId) {
+  await pool.query('DELETE FROM team_members WHERE owner_id = $1 AND member_id = $2', [ownerId, memberId]);
+}
+
+async function logGeneration(userId, billingUserId, data) {
+  try {
+    await pool.query(
+      'INSERT INTO generations (user_id, billing_user, ticket_id, ticket_title, plan, plan_type, industry, device_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [userId, billingUserId, data.ticketId || null, data.ticketTitle || null,
+       data.plan || null, data.planType || null, data.industry || null, data.deviceType || null]
+    );
+  } catch(e) { console.error('[DB] logGeneration error:', e.message); }
+}
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
+// Clean expired pending OAuth codes every minute
 setInterval(function() {
   var now = Date.now();
   Object.keys(pendingCodes).forEach(function(code) {
     if (pendingCodes[code].expiresAt < now) delete pendingCodes[code];
   });
 }, 60000);
+
+// Daily cleanup — remove fully-expired cancelled users from DB
+setInterval(async function() {
+  try {
+    var r = await pool.query(
+      'DELETE FROM users WHERE cancelled_at IS NOT NULL AND access_until IS NOT NULL AND access_until < $1 RETURNING user_id',
+      [Date.now()]
+    );
+    if (r.rowCount > 0) {
+      console.log('[CLEANUP] Removed ' + r.rowCount + ' fully-expired cancelled user(s)');
+    }
+  } catch(e) { console.error('[CLEANUP] Error:', e.message); }
+}, 24 * 60 * 60 * 1000);
+
+// Initialize database then start server
+initDB().then(function() {
+  var PORT = process.env.PORT || 8080;
+  app.listen(PORT, function() {
+    console.log('Structify server running on port ' + PORT);
+    console.log('Paddle env: ' + PADDLE_ENV);
+  });
+}).catch(function(e) {
+  console.error('[DB] Failed to initialize:', e.message);
+  process.exit(1);
+});
 
 function generateCode(data) {
   var code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -168,47 +366,64 @@ function httpsRequest(options, body) {
 }
 
 // ─── USAGE ENDPOINT ──────────────────────────────────────────────────────────
-var PLAN_LIMITS = { pro: 15, business: 40, enterprise: 40 };
+var PLAN_LIMITS = { pro: 15, business: 40, enterprise: 25 };
 var PLAN_SEATS  = { pro: 1, business: 1, enterprise: 5 };
 
-app.get('/usage', function(req, res) {
+app.get('/usage', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId;
   var isDev  = DEVELOPER_IDS.includes(userId);
-  var paid   = paidUsers[userId] || null;
-  var isPaid = isDev || (!!paid && (!paid.accessUntil || Date.now() < paid.accessUntil));
-  var planLimit = paid ? ((PLAN_LIMITS[paid.plan] || 15) + (paid.bonusGenerations || 0)) : FREE_LIMIT;
-  var count  = usageStore[userId] || 0;
-  var isCancelledButActive = !!(paid && paid.cancelledAt && isPaid);
-  res.json({
-    count:       count,
-    limit:       isPaid ? planLimit : FREE_LIMIT,
-    allowed:     isDev || (isPaid && count < planLimit) || (!isPaid && count < FREE_LIMIT),
-    isPaid:      isPaid,
-    plan:        isPaid && paid ? paid.plan : null,
-    planType:    isPaid && paid ? paid.type : null,
-    cancelled:   isCancelledButActive,
-    accessUntil: paid && paid.accessUntil ? paid.accessUntil : null
-  });
+  try {
+    var paid   = await getUser(userId);
+    var isPaid = isDev || (!!paid && (!paid.access_until || Date.now() < paid.access_until));
+
+    // Enterprise members each get their OWN 25-generation counter.
+    // Pro/Business: track against userId directly (no shared pool).
+    // billingId is always the individual user for all plans.
+    var billingId   = userId;
+    var billingPaid = paid;
+
+    // For non-enterprise team members, still resolve plan from owner
+    if (isPaid && paid && paid.team_member_of && paid.plan !== 'enterprise') {
+      billingId   = paid.team_member_of;
+      billingPaid = await getUser(billingId) || paid;
+    }
+
+    var planLimit = billingPaid ? ((PLAN_LIMITS[billingPaid.plan] || 15) + (billingPaid.bonus_generations || 0)) : FREE_LIMIT;
+    var count  = await getUsage(userId); // always per-user
+    var isCancelledButActive = !!(paid && paid.cancelled_at && isPaid);
+    res.json({
+      count:       count,
+      limit:       isPaid ? planLimit : FREE_LIMIT,
+      allowed:     isDev || (isPaid && count < planLimit) || (!isPaid && count < FREE_LIMIT),
+      isPaid:      isPaid,
+      plan:        isPaid && paid ? paid.plan : null,
+      planType:    isPaid && paid ? paid.plan_type : null,
+      cancelled:   isCancelledButActive,
+      accessUntil: paid && paid.access_until ? paid.access_until : null
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── CHECK PAID STATUS ───────────────────────────────────────────────────────
-app.get('/check-paid', function(req, res) {
+app.get('/check-paid', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId;
   if (!userId) return res.status(400).json({ error: 'userId required' });
   var isDev  = DEVELOPER_IDS.includes(userId);
-  var paid   = paidUsers[userId] || null;
-  var isPaid = isDev || (!!paid && (!paid.accessUntil || Date.now() < paid.accessUntil));
-  var isCancelledButActive = !!(paid && paid.cancelledAt && isPaid);
-  res.json({
-    isPaid:      isPaid,
-    plan:        isPaid && paid ? paid.plan : null,
-    planType:    isPaid && paid ? paid.type : null,
-    seats:       isPaid && paid ? paid.seats : null,
-    cancelled:   isCancelledButActive,
-    accessUntil: paid && paid.accessUntil ? paid.accessUntil : null
-  });
+  try {
+    var paid   = await getUser(userId);
+    var isPaid = isDev || (!!paid && (!paid.access_until || Date.now() < paid.access_until));
+    var isCancelledButActive = !!(paid && paid.cancelled_at && isPaid);
+    res.json({
+      isPaid:      isPaid,
+      plan:        isPaid && paid ? paid.plan : null,
+      planType:    isPaid && paid ? paid.plan_type : null,
+      seats:       isPaid && paid ? paid.seats : null,
+      cancelled:   isCancelledButActive,
+      accessUntil: paid && paid.access_until ? paid.access_until : null
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── PADDLE CHECKOUT URL ─────────────────────────────────────────────────────
@@ -238,7 +453,7 @@ app.get('/paddle/checkout-url', function(req, res) {
 // Register in Paddle dashboard → Developer Tools → Notifications:
 //   URL: https://jira-proxy-production-ec4e.up.railway.app/paddle/webhook
 //   Events: subscription.activated, transaction.completed
-app.post('/paddle/webhook', function(req, res) {
+app.post('/paddle/webhook', async function(req, res) {
   var signature = req.headers['paddle-signature'] || '';
   var parts     = {};
   signature.split(';').forEach(function(part) {
@@ -256,6 +471,12 @@ app.post('/paddle/webhook', function(req, res) {
   var rawBody  = req.body;
   var expected = crypto.createHmac('sha256', PADDLE_WEBHOOK_SECRET).update(ts + ':').update(rawBody).digest('hex');
 
+  // Reject webhooks older than 5 minutes — prevents replay attacks
+  var tsAge = Math.abs(Date.now() / 1000 - parseInt(ts, 10));
+  if (tsAge > 300) {
+    console.log('[PADDLE WEBHOOK] Rejected stale webhook — age=' + Math.round(tsAge) + 's');
+    return res.status(401).json({ error: 'Webhook timestamp too old' });
+  }
 
   if (expected !== h1) {
     console.log('[PADDLE WEBHOOK] Invalid signature — rejecting');
@@ -280,31 +501,24 @@ app.post('/paddle/webhook', function(req, res) {
 
     if (userId) {
       var subscriptionId = (event.data && event.data.subscription_id) || (event.data && event.data.id) || null;
-      var existing    = paidUsers[userId] || {};
-      var pending     = existing.pendingUpgrade;
-      var alreadySaved = existing.plan === plan && existing.bonusGenerations !== undefined;
-      var carryOver   = (!alreadySaved && pending && pending.newPlan === plan) ? (pending.carryOver || 0) : (existing.bonusGenerations || 0);
-      paidUsers[userId] = {
-        plan: plan, type: type, seats: seats,
-        paidAt: existing.paidAt || Date.now(),
-        subscriptionId: subscriptionId,
-        bonusGenerations: carryOver
-      };
-      if (!alreadySaved) usageStore[userId] = 0;
-      // If enterprise, generate a team code and store it
-      if (plan === 'enterprise') {
-        if (!existing.teamCode) {
-          var teamCode = 'ENT-' + Math.random().toString(36).toUpperCase().slice(2, 8);
-          paidUsers[userId].teamCode  = teamCode;
-          paidUsers[userId].teamOwner = userId;
-          paidUsers[userId].teamMembers = existing.teamMembers || [];
-        } else {
-          paidUsers[userId].teamCode    = existing.teamCode;
-          paidUsers[userId].teamOwner   = existing.teamOwner || userId;
-          paidUsers[userId].teamMembers = existing.teamMembers || [];
-        }
+      var existing    = await getUser(userId) || {};
+      var pending     = existing.pending_upgrade ? (typeof existing.pending_upgrade === 'string' ? JSON.parse(existing.pending_upgrade) : existing.pending_upgrade) : null;
+      var alreadySaved = existing.plan === plan && existing.bonus_generations !== undefined;
+      var carryOver   = (!alreadySaved && pending && pending.newPlan === plan) ? (pending.carryOver || 0) : (existing.bonus_generations || 0);
+      var teamCode = existing.team_code || null;
+      if (plan === 'enterprise' && !teamCode) {
+        teamCode = 'ENT-' + Math.random().toString(36).toUpperCase().slice(2, 8);
       }
-      saveStore();
+      await saveUser(userId, {
+        plan: plan, type: type, seats: seats,
+        paidAt: existing.paid_at || Date.now(),
+        subscriptionId: subscriptionId,
+        bonusGenerations: carryOver,
+        teamCode: teamCode,
+        teamOwner: plan === 'enterprise' ? (existing.team_owner || userId) : null,
+        teamMemberOf: existing.team_member_of || null
+      });
+      if (!alreadySaved) await setUsage(userId, 0);
       console.log('[PADDLE WEBHOOK] ✅ Paid: userId=' + userId + ' plan=' + plan + ' type=' + type + ' seats=' + seats + ' subId=' + subscriptionId + ' carryOver=' + carryOver);
     } else {
       console.log('[PADDLE WEBHOOK] ⚠️  No userId in custom_data');
@@ -320,10 +534,9 @@ app.post('/paddle/webhook', function(req, res) {
     if (!userId2) {
       var subIdEvt = event.data && event.data.id;
       if (subIdEvt) {
-        Object.keys(paidUsers).forEach(function(uid) {
-          if (paidUsers[uid].subscriptionId === subIdEvt) userId2 = uid;
-        });
-        if (userId2) {
+        var subRow = await pool.query('SELECT user_id FROM users WHERE subscription_id = $1 LIMIT 1', [subIdEvt]);
+        if (subRow.rows[0]) {
+          userId2 = subRow.rows[0].user_id;
           console.log('[PADDLE WEBHOOK] Resolved userId=' + userId2 + ' via subscriptionId=' + subIdEvt);
         } else {
           console.log('[PADDLE WEBHOOK] ⚠️ subscription.cancelled — no userId in custom_data and no match for subId=' + subIdEvt);
@@ -331,17 +544,48 @@ app.post('/paddle/webhook', function(req, res) {
       }
     }
 
-    if (userId2 && paidUsers[userId2]) {
-      var effectiveAt = (event.data.scheduled_change && event.data.scheduled_change.effective_at)
-        || (event.data.current_billing_period && event.data.current_billing_period.ends_at)
-        || null;
-      var accessUntilTs = effectiveAt ? new Date(effectiveAt).getTime() : Date.now();
-      paidUsers[userId2].cancelledAt  = Date.now();
-      paidUsers[userId2].accessUntil  = accessUntilTs;
-      saveStore();
-      console.log('[PADDLE WEBHOOK] ❌ Cancelled: userId=' + userId2 + ' accessUntil=' + new Date(accessUntilTs).toISOString());
-    } else if (!userId2) {
+    if (userId2) {
+      var u2 = await getUser(userId2);
+      if (u2) {
+        var effectiveAt = (event.data.scheduled_change && event.data.scheduled_change.effective_at)
+          || (event.data.current_billing_period && event.data.current_billing_period.ends_at)
+          || null;
+        var accessUntilTs = effectiveAt ? new Date(effectiveAt).getTime() : Date.now();
+        await saveUser(userId2, Object.assign({}, u2, {
+          cancelledAt: Date.now(),
+          accessUntil: accessUntilTs
+        }));
+        console.log('[PADDLE WEBHOOK] ❌ Cancelled: userId=' + userId2 + ' accessUntil=' + new Date(accessUntilTs).toISOString());
+      }
+    } else {
       console.log('[PADDLE WEBHOOK] ⚠️ subscription.cancelled ignored — could not resolve userId. custom_data=' + JSON.stringify(cd2));
+    }
+  }
+
+  // Subscription renewed — reset generation count for the new billing period
+  if (event.event_type === 'subscription.updated') {
+    var cdU   = event.data && event.data.custom_data;
+    var userIdU = cdU && cdU.userId;
+
+    // Fallback: match by subscriptionId
+    if (!userIdU) {
+      var subIdU2 = event.data && event.data.id;
+      if (subIdU2) {
+        var subRow2 = await pool.query('SELECT user_id FROM users WHERE subscription_id = $1 LIMIT 1', [subIdU2]);
+        if (subRow2.rows[0]) userIdU = subRow2.rows[0].user_id;
+      }
+    }
+
+    if (userIdU) {
+      var uRec = await getUser(userIdU);
+      if (uRec) {
+        var isRenewal = !event.data.scheduled_change;
+        if (isRenewal) {
+          await setUsage(userIdU, 0);
+          await saveUser(userIdU, Object.assign({}, uRec, { bonusGenerations: 0 }));
+          console.log('[PADDLE WEBHOOK] 🔄 Renewed: userId=' + userIdU + ' — usage reset to 0');
+        }
+      }
     }
   }
 
@@ -349,132 +593,119 @@ app.post('/paddle/webhook', function(req, res) {
 });
 
 // ─── UPGRADE (carry-over) ────────────────────────────────────────────────────
-app.post('/paddle/upgrade', function(req, res) {
+app.post('/paddle/upgrade', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId  = req.body.userId;
   var newPlan = req.body.newPlan;
   var newType = req.body.newType || 'structify';
   var seats   = parseInt(req.body.seats) || 1;
   if (!userId || !newPlan) return res.status(400).json({ error: 'userId and newPlan required' });
-  var paid      = paidUsers[userId] || null;
-  var oldPlan   = paid ? paid.plan : null;
-  var oldLimit  = oldPlan ? ((PLAN_LIMITS[oldPlan] || 0) + (paid.bonusGenerations || 0)) : FREE_LIMIT;
-  var usedCount = usageStore[userId] || 0;
-  var remaining = Math.max(0, oldLimit - usedCount);
-  if (!paidUsers[userId]) paidUsers[userId] = {};
-  paidUsers[userId].pendingUpgrade = {
-    newPlan: newPlan, newType: newType, seats: seats,
-    carryOver: remaining, requestedAt: Date.now()
-  };
-  saveStore();
-  console.log('[UPGRADE] userId=' + userId + ' ' + oldPlan + ' → ' + newPlan + ' carryOver=' + remaining);
-  res.json({ ok: true, carryOver: remaining });
+  try {
+    var paid      = await getUser(userId) || {};
+    var oldPlan   = paid.plan || null;
+    var oldLimit  = oldPlan ? ((PLAN_LIMITS[oldPlan] || 0) + (paid.bonus_generations || 0)) : FREE_LIMIT;
+    var usedCount = await getUsage(userId);
+    var remaining = Math.max(0, oldLimit - usedCount);
+    await saveUser(userId, Object.assign({}, paid, {
+      pendingUpgrade: { newPlan: newPlan, newType: newType, seats: seats, carryOver: remaining, requestedAt: Date.now() }
+    }));
+    console.log('[UPGRADE] userId=' + userId + ' ' + oldPlan + ' → ' + newPlan + ' carryOver=' + remaining);
+    res.json({ ok: true, carryOver: remaining });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── ENTERPRISE TEAM ──────────────────────────────────────────────────────────
 // GET /team/code?userId=XXX  — returns the owner's team code + member list
-app.get('/team/code', function(req, res) {
+app.get('/team/code', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId;
   if (!userId) return res.status(400).json({ error: 'userId required' });
-  var paid = paidUsers[userId];
-  if (!paid || paid.plan !== 'enterprise') return res.status(403).json({ error: 'Enterprise plan required' });
-  var maxSeats  = paid.seats || 5;
-  var members   = paid.teamMembers || [];
-  var used      = members.length + 1; // +1 for owner
-  res.json({
-    teamCode: paid.teamCode,
-    owner:    userId,
-    members:  members,
-    used:     used,
-    maxSeats: maxSeats
-  });
+  try {
+    var paid = await getUser(userId);
+    if (!paid || paid.plan !== 'enterprise') return res.status(403).json({ error: 'Enterprise plan required' });
+    var members  = await getTeamMembers(userId);
+    var maxSeats = paid.seats || 5;
+    res.json({
+      teamCode: paid.team_code,
+      owner:    userId,
+      members:  members,
+      used:     members.length + 1,
+      maxSeats: maxSeats
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /team/join  { userId, teamCode }  — member joins an enterprise team
-app.post('/team/join', function(req, res) {
+app.post('/team/join', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId   = req.body.userId;
   var teamCode = (req.body.teamCode || '').toUpperCase().trim();
   if (!userId || !teamCode) return res.status(400).json({ error: 'userId and teamCode required' });
 
-  // Find the owner who has this teamCode
-  var ownerId = null;
-  Object.keys(paidUsers).forEach(function(uid) {
-    if (paidUsers[uid].teamCode === teamCode) ownerId = uid;
-  });
-  if (!ownerId) return res.status(404).json({ error: 'Team code not found' });
+  try {
+    var ownerRow = await pool.query('SELECT * FROM users WHERE team_code = $1 LIMIT 1', [teamCode]);
+    if (!ownerRow.rows[0]) return res.status(404).json({ error: 'Team code not found' });
+    var owner   = ownerRow.rows[0];
+    var ownerId = owner.user_id;
 
-  var owner    = paidUsers[ownerId];
-  var maxSeats = owner.seats || 5;
-  var members  = owner.teamMembers || [];
+    if (owner.plan !== 'enterprise') return res.status(403).json({ error: 'Team owner does not have an enterprise plan' });
+    if (owner.access_until && Date.now() >= owner.access_until) return res.status(403).json({ error: 'Team owner\'s subscription has expired' });
+    if (ownerId === userId) return res.status(400).json({ error: 'You are the team owner' });
 
-  // Already a member or already the owner
-  if (ownerId === userId) return res.status(400).json({ error: 'You are the team owner' });
-  if (members.includes(userId)) {
-    // Already joined — just return success
-    return res.json({ ok: true, plan: owner.plan, type: owner.type, alreadyMember: true });
-  }
+    var members  = await getTeamMembers(ownerId);
+    var maxSeats = owner.seats || 5;
 
-  // Check seat limit (owner + members)
-  if (members.length + 1 >= maxSeats) {
-    return res.status(403).json({ error: 'Team is full (' + maxSeats + '/' + maxSeats + ' seats used)' });
-  }
+    if (members.includes(userId)) return res.json({ ok: true, plan: owner.plan, type: owner.plan_type, alreadyMember: true });
+    if (members.length + 1 >= maxSeats) return res.status(403).json({ error: 'Team is full (' + maxSeats + '/' + maxSeats + ' seats used)' });
 
-  // Add member
-  members.push(userId);
-  paidUsers[ownerId].teamMembers = members;
+    await addTeamMember(ownerId, userId);
+    await saveUser(userId, { plan: owner.plan, type: owner.plan_type, seats: 1, paidAt: Date.now(), teamMemberOf: ownerId, bonusGenerations: 0 });
 
-  // Give member paid access mirrored from owner
-  paidUsers[userId] = {
-    plan: owner.plan, type: owner.type, seats: 1,
-    paidAt: Date.now(), teamMemberOf: ownerId,
-    bonusGenerations: 0
-  };
-  usageStore[userId] = usageStore[userId] || 0;
-  saveStore();
-  console.log('[TEAM JOIN] userId=' + userId + ' joined team of ownerId=' + ownerId + ' code=' + teamCode);
-  res.json({ ok: true, plan: owner.plan, type: owner.type });
+    console.log('[TEAM JOIN] userId=' + userId + ' joined team of ownerId=' + ownerId + ' code=' + teamCode);
+    res.json({ ok: true, plan: owner.plan, type: owner.plan_type });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /team/leave  { userId }  — member leaves a team
-app.post('/team/leave', function(req, res) {
+app.post('/team/leave', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.body.userId;
   if (!userId) return res.status(400).json({ error: 'userId required' });
-  var paid = paidUsers[userId];
-  if (!paid || !paid.teamMemberOf) return res.status(400).json({ error: 'Not a team member' });
-  var ownerId = paid.teamMemberOf;
-  if (paidUsers[ownerId] && paidUsers[ownerId].teamMembers) {
-    paidUsers[ownerId].teamMembers = paidUsers[ownerId].teamMembers.filter(function(m) { return m !== userId; });
-  }
-  delete paidUsers[userId];
-  saveStore();
-  console.log('[TEAM LEAVE] userId=' + userId + ' left team of ownerId=' + ownerId);
-  res.json({ ok: true });
+  try {
+    var paid = await getUser(userId);
+    if (!paid || !paid.team_member_of) return res.status(400).json({ error: 'Not a team member' });
+    var ownerId = paid.team_member_of;
+    await removeTeamMember(ownerId, userId);
+    await deleteUser(userId);
+    console.log('[TEAM LEAVE] userId=' + userId + ' left team of ownerId=' + ownerId);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /team/remove  { ownerId, memberId }  — owner removes a member
-app.post('/team/remove', function(req, res) {
+app.post('/team/remove', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ownerId  = req.body.ownerId;
   var memberId = req.body.memberId;
   if (!ownerId || !memberId) return res.status(400).json({ error: 'ownerId and memberId required' });
-  var owner = paidUsers[ownerId];
-  if (!owner || owner.plan !== 'enterprise') return res.status(403).json({ error: 'Enterprise plan required' });
-  if (paidUsers[ownerId].teamMembers) {
-    paidUsers[ownerId].teamMembers = paidUsers[ownerId].teamMembers.filter(function(m) { return m !== memberId; });
-  }
-  if (paidUsers[memberId] && paidUsers[memberId].teamMemberOf === ownerId) {
-    delete paidUsers[memberId];
-  }
-  saveStore();
-  console.log('[TEAM REMOVE] ownerId=' + ownerId + ' removed memberId=' + memberId);
-  res.json({ ok: true });
+  try {
+    var owner = await getUser(ownerId);
+    if (!owner || owner.plan !== 'enterprise') return res.status(403).json({ error: 'Enterprise plan required' });
+    await removeTeamMember(ownerId, memberId);
+    var member = await getUser(memberId);
+    if (member && member.team_member_of === ownerId) await deleteUser(memberId);
+    console.log('[TEAM REMOVE] ownerId=' + ownerId + ' removed memberId=' + memberId);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── DEBUG ───────────────────────────────────────────────────────────────────
-app.get('/debug', function(req, res) {
+// Protected with DEBUG_KEY env var — set this in Railway to a long random string
+app.get('/debug', async function(req, res) {
+  var debugKey = process.env.DEBUG_KEY || '';
+  if (!debugKey || req.headers['x-debug-key'] !== debugKey) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   res.json({
     jiraClientId:    JIRA_CLIENT_ID ? JIRA_CLIENT_ID.substring(0, 8) : 'NOT SET',
     hasJiraSecret:   !!JIRA_CLIENT_SECRET,
@@ -482,26 +713,42 @@ app.get('/debug', function(req, res) {
     hasClaudeKey:    !!CLAUDE_API_KEY,
     paddleEnv:       PADDLE_ENV,
     hasPaddleSecret: !!PADDLE_WEBHOOK_SECRET,
-    paidUsersCount:  Object.keys(paidUsers).length,
+    paidUsersCount:  (await pool.query("SELECT COUNT(*) FROM users WHERE cancelled_at IS NULL")).rows[0].count,
     prices:          PADDLE_PRICES
   });
 });
 
+// ─── OAUTH STATE STORE (in-memory, short-lived) ───────────────────────────────
+var pendingStates = {}; // state -> { provider, createdAt }
+setInterval(function() {
+  var now = Date.now();
+  Object.keys(pendingStates).forEach(function(s) {
+    if (now - pendingStates[s].createdAt > 10 * 60 * 1000) delete pendingStates[s];
+  });
+}, 60000);
+
 // ─── JIRA AUTH ───────────────────────────────────────────────────────────────
-app.get('/auth/jira', function(req, res) {
+app.get('/auth/jira', async function(req, res) {
+  var state = crypto.randomBytes(16).toString('hex');
+  pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
   var url = 'https://auth.atlassian.com/authorize' +
     '?audience=api.atlassian.com' +
     '&client_id=' + JIRA_CLIENT_ID +
     '&scope=' + encodeURIComponent('read:jira-work write:jira-work read:jira-user offline_access') +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/jira/callback') +
-    '&state=' + crypto.randomBytes(16).toString('hex') +
+    '&state=' + state +
     '&response_type=code';
   res.redirect(url);
 });
 
 app.get('/auth/jira/callback', async function(req, res) {
-  var code = req.query.code;
+  var code  = req.query.code;
+  var state = req.query.state;
   if (!code) return res.status(400).send('<h2>Error: No code</h2>');
+  if (!state || !pendingStates[state] || pendingStates[state].provider !== 'jira') {
+    return res.status(403).send('<h2>Error: Invalid or expired state. Please try connecting again.</h2>');
+  }
+  delete pendingStates[state];
   try {
     var body = JSON.stringify({ grant_type: 'authorization_code', client_id: JIRA_CLIENT_ID, client_secret: JIRA_CLIENT_SECRET, code: code, redirect_uri: BASE_URL + '/auth/jira/callback' });
     var tokenRes = await httpsRequest({ hostname: 'auth.atlassian.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, body);
@@ -515,19 +762,26 @@ app.get('/auth/jira/callback', async function(req, res) {
 });
 
 // ─── GITLAB AUTH ─────────────────────────────────────────────────────────────
-app.get('/auth/gitlab', function(req, res) {
+app.get('/auth/gitlab', async function(req, res) {
+  var state = crypto.randomBytes(16).toString('hex');
+  pendingStates[state] = { provider: 'gitlab', createdAt: Date.now() };
   var url = 'https://gitlab.com/oauth/authorize' +
     '?client_id=' + GITLAB_CLIENT_ID +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback') +
     '&response_type=code' +
     '&scope=' + encodeURIComponent('api') +
-    '&state=' + crypto.randomBytes(16).toString('hex');
+    '&state=' + state;
   res.redirect(url);
 });
 
 app.get('/auth/gitlab/callback', async function(req, res) {
-  var code = req.query.code;
+  var code  = req.query.code;
+  var state = req.query.state;
   if (!code) return res.status(400).send('<h2>Error: No code</h2>');
+  if (!state || !pendingStates[state] || pendingStates[state].provider !== 'gitlab') {
+    return res.status(403).send('<h2>Error: Invalid or expired state. Please try connecting again.</h2>');
+  }
+  delete pendingStates[state];
   try {
     var body = 'client_id=' + encodeURIComponent(GITLAB_CLIENT_ID) +
       '&client_secret=' + encodeURIComponent(GITLAB_CLIENT_SECRET) +
@@ -543,7 +797,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
 });
 
 // ─── AUTH TOKEN EXCHANGE ─────────────────────────────────────────────────────
-app.get('/auth/token', function(req, res) {
+app.get('/auth/token', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
   if (!code || !pendingCodes[code]) return res.status(404).json({ error: 'Invalid or expired code' });
@@ -553,12 +807,37 @@ app.get('/auth/token', function(req, res) {
   res.json(data);
 });
 
-// ─── SPACES ──────────────────────────────────────────────────────────────────
-app.get('/spaces', async function(req, res) {
+// ─── JIRA TOKEN REFRESH ──────────────────────────────────────────────────────
+// Called by code.js when a Jira API call returns 401 (token expired)
+app.post('/auth/jira/refresh', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var accessToken = req.query.accessToken;
-  var cloudId     = req.query.cloudId;
-  var provider    = req.query.provider || 'jira';
+  var refreshToken = req.body.refreshToken;
+  if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
+  try {
+    var body = JSON.stringify({
+      grant_type:    'refresh_token',
+      client_id:     JIRA_CLIENT_ID,
+      client_secret: JIRA_CLIENT_SECRET,
+      refresh_token: refreshToken
+    });
+    var tokenRes = await httpsRequest({
+      hostname: 'auth.atlassian.com', path: '/oauth/token', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, body);
+    if (!tokenRes.data.access_token) {
+      return res.status(401).json({ error: 'Refresh failed', detail: tokenRes.data });
+    }
+    res.json({ accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token || refreshToken });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── SPACES ──────────────────────────────────────────────────────────────────
+// POST instead of GET so accessToken never appears in server logs or browser history
+app.post('/spaces', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var accessToken = req.body.accessToken;
+  var cloudId     = req.body.cloudId;
+  var provider    = req.body.provider || 'jira';
   try {
     if (provider === 'gitlab') {
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
@@ -582,14 +861,14 @@ app.get('/debug-spaces', async function(req, res) {
 });
 
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
-app.get('/tickets', async function(req, res) {
+app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var accessToken = req.query.accessToken;
-  var cloudId     = req.query.cloudId;
-  var provider    = req.query.provider || 'jira';
+  var accessToken = req.body.accessToken;
+  var cloudId     = req.body.cloudId;
+  var provider    = req.body.provider || 'jira';
   try {
     if (provider === 'gitlab') {
-      var projectId = req.query.spaceId;
+      var projectId = req.body.spaceId;
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
       var glPath = '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?state=opened&per_page=30';
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: glPath, method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
@@ -598,7 +877,7 @@ app.get('/tickets', async function(req, res) {
       });
       return res.json({ tickets: tickets });
     }
-    var spaceId = req.query.spaceId;
+    var spaceId = req.body.spaceId;
     var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
     var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql + '&maxResults=30&fields=summary,description,status,priority', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     if (!jiraRes.data.issues) return res.status(500).json({ error: 'No issues', raw: jiraRes.data });
@@ -712,35 +991,38 @@ app.post('/analyze', async function(req, res) {
 
   var userId = req.body.userId;
   var isDev  = DEVELOPER_IDS.includes(userId);
-  var isPaid = !!(paidUsers[userId]);
 
-  var paidRecord = paidUsers[userId] || null;
-  // Respect accessUntil: cancelled users keep access until period ends
-  if (paidRecord && paidRecord.accessUntil && Date.now() >= paidRecord.accessUntil) {
-    isPaid = false;
-  }
-  var userLimit = isDev ? 999999 : (isPaid ? ((PLAN_LIMITS[paidRecord.plan] || 15) + (paidRecord.bonusGenerations || 0)) : FREE_LIMIT);
-  var count = usageStore[userId] || 0;
+  var paidRecord = await getUser(userId);
+  var isPaid = isDev || (!!paidRecord && (!paidRecord.access_until || Date.now() < paidRecord.access_until));
 
-  if (!isDev) {
-    if (count >= userLimit) {
-      console.log('[ANALYZE] limit_reached for userId=' + userId + ' count=' + count + '/' + userLimit);
-      return res.json({ error: 'limit_reached' });
-    }
-    usageStore[userId] = count + 1;
-    saveStore();
-    console.log('[ANALYZE] userId=' + userId + ' usage=' + (count + 1) + '/' + userLimit + ' isPaid=' + isPaid);
+  // Enterprise members each get their OWN 25-generation counter — billingUserId = userId.
+  // This means each of the 5 seats can generate 25 times independently.
+  var billingUserId = userId;
+
+  // Resolve paidRecord: for team members get owner's record to check plan/limit
+  if (isPaid && paidRecord && paidRecord.team_member_of) {
+    var ownerRecord = await getUser(paidRecord.team_member_of);
+    if (ownerRecord) paidRecord = ownerRecord; // use owner's plan for limit lookup
+    // billingUserId stays as userId — each member has their own count
   }
 
-  var ticketId               = req.body.ticketId;
-  var ticketTitle            = req.body.ticketTitle;
-  var ticketDesc             = req.body.ticketDesc;
+  var userLimit = isDev ? 999999 : (isPaid ? ((PLAN_LIMITS[paidRecord.plan] || 15) + (paidRecord.bonus_generations || 0)) : FREE_LIMIT);
+  var count = await getUsage(billingUserId); // always per-user
+
+  if (!isDev && count >= userLimit) {
+    console.log('[ANALYZE] limit_reached for userId=' + userId + ' billingUserId=' + billingUserId + ' count=' + count + '/' + userLimit);
+    return res.json({ error: 'limit_reached' });
+  }
+
+  var ticketId               = (req.body.ticketId    || '').toString().substring(0, 100);
+  var ticketTitle            = (req.body.ticketTitle  || '').toString().substring(0, 200);
+  var ticketDesc             = (req.body.ticketDesc   || '').toString().substring(0, 5000);
   var industry               = req.body.industry || 'Other';
   var deviceType             = req.body.deviceType || 'mobile';
   var deviceW                = req.body.deviceW || 390;
   var deviceH                = req.body.deviceH || 844;
-  var companyContext         = req.body.companyContext || '';
-  var additionalInstructions = req.body.additionalInstructions || '';
+  var companyContext         = (req.body.companyContext         || '').toString().substring(0, 500);
+  var additionalInstructions = (req.body.additionalInstructions || '').toString().substring(0, 500);
 
   var INDUSTRY_PROMPTS = {
     'E-commerce':       'Focus on: product browsing, cart flows, checkout, wishlist, order tracking, empty states, payment errors.',
@@ -796,6 +1078,40 @@ app.post('/analyze', async function(req, res) {
       }
     }
     res.json({ plan: plan });
+    // Only count the generation after a successful response — not on failure or timeout
+    if (!isDev) {
+      var newCount = await incrementUsage(billingUserId);
+      await logGeneration(userId, billingUserId, {
+        ticketId: ticketId, ticketTitle: ticketTitle,
+        plan: paidRecord ? paidRecord.plan : null,
+        planType: paidRecord ? paidRecord.plan_type : null,
+        industry: industry, deviceType: deviceType
+      });
+      console.log('[ANALYZE] userId=' + userId + ' billingUserId=' + billingUserId + ' usage=' + newCount + '/' + userLimit + ' isPaid=' + isPaid);
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── GENERATE COMMENT (AI handoff comment — does NOT count as a generation) ──
+app.post('/generate-comment', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var prompt = req.body.prompt || '';
+  if (!prompt) return res.status(400).json({ error: 'prompt required' });
+  if (!CLAUDE_API_KEY) return res.status(500).json({ error: 'Claude API key not configured' });
+
+  var body = JSON.stringify({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 300,
+    messages: [{ role: 'user', content: prompt + '\n\nRespond with only the comment text, no preamble.' }]
+  });
+  try {
+    var r = await httpsRequest({
+      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) }
+    }, body);
+    if (r.status !== 200) return res.status(500).json({ error: 'Claude error: ' + r.status });
+    var text = r.data.content[0].text.trim();
+    res.json({ comment: text });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -835,22 +1151,20 @@ app.post('/paddle/cancel', async function(req, res) {
   var userId = req.body.userId;
   if (!userId) return res.status(400).json({ error: 'userId required' });
 
-  var paid = paidUsers[userId];
+  var paid = await getUser(userId);
   if (!paid) return res.status(400).json({ error: 'No active subscription found' });
 
   // Already cancelled — return existing accessUntil immediately, don't call Paddle again
-  if (paid.cancelledAt && paid.accessUntil) {
-    console.log('[CANCEL] Already cancelled for userId=' + userId + ' accessUntil=' + new Date(paid.accessUntil).toISOString());
-    return res.json({ ok: true, accessUntil: paid.accessUntil, alreadyCancelled: true });
+  if (paid.cancelled_at && paid.access_until) {
+    console.log('[CANCEL] Already cancelled for userId=' + userId + ' accessUntil=' + new Date(paid.access_until).toISOString());
+    return res.json({ ok: true, accessUntil: paid.access_until, alreadyCancelled: true });
   }
 
-  var subscriptionId = paid.subscriptionId;
+  var subscriptionId = paid.subscription_id;
 
   // No subscriptionId — cancel immediately as fallback
   if (!subscriptionId) {
-    paidUsers[userId].cancelledAt = Date.now();
-    paidUsers[userId].accessUntil = Date.now();
-    saveStore();
+    await saveUser(userId, Object.assign({}, paid, { cancelledAt: Date.now(), accessUntil: Date.now() }));
     console.log('[CANCEL] No subscriptionId — cancelled immediately for userId=' + userId);
     return res.json({ ok: true, accessUntil: null });
   }
@@ -859,9 +1173,7 @@ app.post('/paddle/cancel', async function(req, res) {
 
   // No API key — cancel immediately as fallback
   if (!paddleApiKey) {
-    paidUsers[userId].cancelledAt = Date.now();
-    paidUsers[userId].accessUntil = Date.now();
-    saveStore();
+    await saveUser(userId, Object.assign({}, paid, { cancelledAt: Date.now(), accessUntil: Date.now() }));
     console.log('[CANCEL] No PADDLE_API_KEY — cancelled immediately for userId=' + userId);
     return res.json({ ok: true, accessUntil: null });
   }
@@ -894,23 +1206,22 @@ app.post('/paddle/cancel', async function(req, res) {
       }
       // Mark cancelled locally — use accessUntil from Paddle response if available,
       // else keep existing accessUntil, else fall back to approx 30-day period
-      paidUsers[userId].cancelledAt = Date.now();
-      if (!paidUsers[userId].accessUntil) {
-        // Try to read scheduled_change.effective_at from Paddle response
+      var cancelledAt = Date.now();
+      var accessUntilFinal = paid.access_until || null;
+      if (!accessUntilFinal) {
         var paddleEffective = cancelRes.data && cancelRes.data.data &&
           cancelRes.data.data.scheduled_change && cancelRes.data.data.scheduled_change.effective_at;
         if (paddleEffective) {
-          paidUsers[userId].accessUntil = new Date(paddleEffective).getTime();
+          accessUntilFinal = new Date(paddleEffective).getTime();
           console.log('[CANCEL] accessUntil from Paddle response: ' + paddleEffective);
         } else {
-          var approxEnd = (paid.paidAt || Date.now()) + 30 * 24 * 60 * 60 * 1000;
-          paidUsers[userId].accessUntil = approxEnd;
+          accessUntilFinal = (paid.paid_at || Date.now()) + 30 * 24 * 60 * 60 * 1000;
           console.log('[CANCEL] accessUntil approximated to 30 days from paidAt');
         }
       }
-      saveStore();
-      console.log('[CANCEL] ✅ Queued: userId=' + userId + ' accessUntil=' + new Date(paidUsers[userId].accessUntil).toISOString());
-      return res.json({ ok: true, accessUntil: paidUsers[userId].accessUntil });
+      await saveUser(userId, Object.assign({}, paid, { cancelledAt: cancelledAt, accessUntil: accessUntilFinal }));
+      console.log('[CANCEL] ✅ Queued: userId=' + userId + ' accessUntil=' + new Date(accessUntilFinal).toISOString());
+      return res.json({ ok: true, accessUntil: accessUntilFinal });
     } else {
       console.error('[CANCEL] ❌ Paddle rejected cancel: status=' + cancelRes.status + ' body=' + JSON.stringify(cancelRes.data));
       return res.status(500).json({ error: 'Paddle cancel failed: ' + cancelRes.status, detail: cancelRes.data });
@@ -919,13 +1230,4 @@ app.post('/paddle/cancel', async function(req, res) {
     console.error('[CANCEL] Paddle API error:', e.message);
     return res.status(500).json({ error: 'Network error contacting Paddle: ' + e.message });
   }
-});
-
-// ─── START SERVER ─────────────────────────────────────────────────────────────
-var PORT = process.env.PORT || 8080;
-app.listen(PORT, function() {
-  console.log('Structify server running on port ' + PORT);
-  console.log('Paddle env: ' + PADDLE_ENV);
-  console.log('Paddle webhook secret set: ' + !!PADDLE_WEBHOOK_SECRET);
-  console.log('Price IDs loaded: ' + JSON.stringify(PADDLE_PRICES));
 });
