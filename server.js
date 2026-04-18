@@ -19,9 +19,17 @@ app.use(helmet({
 }));
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
-// Railway sits behind a proxy — validate:false suppresses the X-Forwarded-For warning
-// trust proxy:1 tells Express to use the first forwarded IP for rate limiting
-var _rlBase = { standardHeaders: true, legacyHeaders: false, validate: { xForwardedForHeader: false } };
+// Keyed by userId from request body (more reliable than IP behind Railway's proxy)
+// Falls back to IP if no userId present
+function _rlKey(req) {
+  return (req.body && req.body.userId) ? 'uid:' + req.body.userId : (req.ip || 'unknown');
+}
+var _rlBase = {
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  keyGenerator: _rlKey
+};
 app.use('/analyze',          rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10, message: { error: 'Too many requests, slow down.' } })));
 app.use('/chat',             rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 30 })));
 app.use('/auth/token',       rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 20 })));
