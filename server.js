@@ -4,7 +4,6 @@ const cors = require('cors');
 const https = require('https');
 const crypto = require('crypto');
 const path = require('path');
-const rateLimit = null; // replaced with custom rateLimiter()
 const helmet = require('helmet');
 
 const app = express();
@@ -23,14 +22,6 @@ app.use(helmet({
 // Runs AFTER body parsing so req.body.userId is available.
 // Resets every 60 seconds per key.
 var _rateCounts = {}; // key -> { count, resetAt }
-var RATE_LIMITS = {
-  '/analyze':          10,
-  '/chat':             30,
-  '/auth/token':       20,
-  '/generate-comment': 20,
-  '/auth/jira':        10,
-  '/auth/gitlab':      10
-};
 
 function rateLimiter(maxPerMinute) {
   return function(req, res, next) {
@@ -877,16 +868,6 @@ app.post('/spaces', async function(req, res) {
     var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     var projects = (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; });
     res.json({ spaces: projects });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/debug-spaces', async function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  var accessToken = req.query.accessToken;
-  var cloudId     = req.query.cloudId;
-  try {
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-    res.json({ status: jiraRes.status, data: jiraRes.data });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
