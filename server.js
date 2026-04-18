@@ -9,6 +9,9 @@ const helmet = require('helmet');
 
 const app = express();
 
+// Railway sits behind a proxy — required for express-rate-limit to work correctly
+app.set('trust proxy', 1);
+
 // ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
 app.use(helmet({
   contentSecurityPolicy: false, // Disabled — Paddle.js loads from CDN
