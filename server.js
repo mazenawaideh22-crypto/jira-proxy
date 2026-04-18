@@ -19,17 +19,15 @@ app.use(helmet({
 }));
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
-// /analyze: max 10 requests per minute per IP (prevents Claude API cost abuse)
-app.use('/analyze', rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, slow down.' } }));
-// /chat: max 30 per minute per IP
-app.use('/chat', rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false }));
-// /auth/token: max 20 per minute per IP (prevents brute-force on 6-digit codes)
-app.use('/auth/token', rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
-// /auth/jira and /auth/gitlab: max 10 per minute per IP
-app.use('/auth/jira', rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false }));
-app.use('/auth/gitlab', rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false }));
-// /generate-comment: max 20 per minute per IP
-app.use('/generate-comment', rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
+// Railway sits behind a proxy — validate:false suppresses the X-Forwarded-For warning
+// trust proxy:1 tells Express to use the first forwarded IP for rate limiting
+var _rlBase = { standardHeaders: true, legacyHeaders: false, validate: { xForwardedForHeader: false } };
+app.use('/analyze',          rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10, message: { error: 'Too many requests, slow down.' } })));
+app.use('/chat',             rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 30 })));
+app.use('/auth/token',       rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 20 })));
+app.use('/auth/jira',        rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10 })));
+app.use('/auth/gitlab',      rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 10 })));
+app.use('/generate-comment', rateLimit(Object.assign({}, _rlBase, { windowMs: 60000, max: 20 })));
 
 // IMPORTANT: Raw body parser MUST come before express.json()
 // Paddle webhook needs the raw body for signature verification
