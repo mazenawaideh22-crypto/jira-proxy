@@ -40,10 +40,7 @@ function successPage(code, service) {
   // This prevents Safari from reloading the callback URL after the success page shows
   return '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Structify</title>' +
     '<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#0a0a0f;color:#f0f0f5;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#111118;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:40px;text-align:center;max-width:380px;width:90%}.icon{font-size:48px;margin-bottom:16px}h1{font-size:22px;font-weight:700;margin-bottom:8px}p{font-size:13px;color:#6b6b80;margin-bottom:24px;line-height:1.6}.code-box{background:#0d1f1a;border:2px solid #18D4A7;border-radius:14px;padding:20px;margin-bottom:24px}.code-label{font-size:11px;color:#6b6b80;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px}.code{font-size:42px;font-weight:800;letter-spacing:0.2em;color:#18D4A7;font-family:monospace}.note{font-size:11px;color:#3a3a4a}.close-btn{background:#18D4A7;color:#07101F;border:none;padding:12px 32px;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px}</style>' +
-    '<script>' +
-    // Replace the callback URL (with ?code=xxx) with a clean URL immediately
-    // This stops Safari from reloading the callback URL
-'</script>' +
+    '<script>try{if(window.history&&window.history.replaceState){window.history.replaceState({},"Structify","/?connected=1");}}catch(e){}<\/script>' +
     '</head><body><div class="card"><div class="icon">✅</div><h1>Connected to ' + service + '!</h1><p>Enter this code in Structify to complete the connection.</p><div class="code-box"><div class="code-label">Your Plugin Code</div><div class="code">' + code + '</div></div><p class="note">This code expires in 5 minutes.</p><br><button class="close-btn" onclick="window.close()">Close & Return to Figma</button></div></body></html>';
 }
 
