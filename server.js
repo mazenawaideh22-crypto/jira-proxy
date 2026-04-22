@@ -489,6 +489,83 @@ app.get('/paddle/checkout-url', function(req, res) {
   res.json({ priceId: priceId, clientToken: clientToken, userId: userId, plan: plan, type: type, seats: seats, sandbox: isSandbox });
 });
 
+// ─── PADDLE CREATE TRANSACTION ───────────────────────────────────────────────
+// Creates a Paddle transaction server-side and returns transaction_id
+// Plugin uses transactionId in Paddle.Checkout.open() — works in live mode
+// whereas priceId-based checkout is blocked by Figma CSP in live mode
+app.get('/paddle/create-transaction', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var userId = req.query.userId;
+  var plan   = req.query.plan  || 'pro';
+  var type   = req.query.type  || 'structify';
+  var seats  = parseInt(req.query.seats) || 1;
+
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+
+  var apiKey      = process.env.PADDLE_API_KEY || '';
+  var clientToken = process.env.PADDLE_CLIENT_TOKEN || '';
+  if (!apiKey)      return res.status(500).json({ error: 'PADDLE_API_KEY not set' });
+  if (!clientToken) return res.status(500).json({ error: 'PADDLE_CLIENT_TOKEN not set' });
+
+  var priceGroup = PADDLE_PRICES[type] || PADDLE_PRICES.structify;
+  var priceId    = priceGroup[plan] || priceGroup.pro;
+  var isSandbox  = PADDLE_ENV !== 'live';
+  var hostname   = isSandbox ? 'sandbox-api.paddle.com' : 'api.paddle.com';
+
+  var body = JSON.stringify({
+    items: [{ price_id: priceId, quantity: seats }],
+    custom_data: { userId: userId, plan: plan, type: type, seats: seats },
+    checkout: { url: 'https://structifyui.com' }
+  });
+
+  console.log('[PADDLE] Creating transaction → plan=' + plan + ' userId=' + userId + ' priceId=' + priceId);
+
+  try {
+    var https = require('https');
+    var result = await new Promise(function(resolve, reject) {
+      var options = {
+        hostname: hostname,
+        path: '/transactions',
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + apiKey,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      };
+      var reqH = https.request(options, function(resp) {
+        var data = '';
+        resp.on('data', function(chunk) { data += chunk; });
+        resp.on('end', function() { resolve({ status: resp.statusCode, body: data }); });
+      });
+      reqH.on('error', reject);
+      reqH.write(body);
+      reqH.end();
+    });
+
+    var parsed = JSON.parse(result.body);
+    if (result.status !== 201 || !parsed.data || !parsed.data.id) {
+      console.log('[PADDLE] Transaction creation failed:', result.status, result.body);
+      return res.status(500).json({ error: 'Failed to create transaction', detail: parsed });
+    }
+
+    var transactionId = parsed.data.id;
+    console.log('[PADDLE] Transaction created → txId=' + transactionId);
+    res.json({
+      transactionId: transactionId,
+      clientToken: clientToken,
+      userId: userId,
+      plan: plan,
+      type: type,
+      seats: seats,
+      sandbox: isSandbox
+    });
+  } catch(e) {
+    console.log('[PADDLE] Transaction error:', e.message);
+    res.status(500).json({ error: 'Transaction creation error', detail: e.message });
+  }
+});
+
 // ─── PADDLE WEBHOOK ──────────────────────────────────────────────────────────
 // Register in Paddle dashboard → Developer Tools → Notifications:
 //   URL: https://jira-proxy-production-ec4e.up.railway.app/paddle/webhook
