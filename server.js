@@ -272,7 +272,6 @@ app.post('/spaces', async function(req, res) {
   console.log('[SPACES] Provider:', provider);
   console.log('[SPACES] AccessToken present:', !!accessToken);
   console.log('[SPACES] AccessToken first 20 chars:', accessToken ? accessToken.substring(0, 20) + '...' : 'none');
-  console.log('[SPACES] CloudId:', cloudId);
   
   if (!accessToken) {
     console.log('[SPACES] ERROR: No access token provided');
@@ -283,50 +282,95 @@ app.post('/spaces', async function(req, res) {
     if (provider === 'gitlab') {
       console.log('[SPACES] Fetching GitLab projects...');
       
-      // FIX: Use the correct GitLab API endpoint
-      // Changed from /api/v4/projects?membership=true to use proper pagination and headers
+      // Try a simpler endpoint that should always work
+      // First try: get user's projects (this should work with any valid token)
       var glRes = await httpsRequest({ 
         hostname: 'gitlab.com', 
-        path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20&simple=true', 
+        path: '/api/v4/projects?per_page=20', 
         method: 'GET', 
         headers: { 
           'Authorization': 'Bearer ' + accessToken, 
-          'Accept': 'application/json',
-          'User-Agent': 'Structify-Plugin/1.0'
+          'Accept': 'application/json' 
         } 
       });
       
       console.log('[SPACES] GitLab response status:', glRes.status);
-      
-      // Log the actual response for debugging
-      if (glRes.status !== 200) {
-        console.log('[SPACES] GitLab response body:', JSON.stringify(glRes.data).substring(0, 500));
-      }
-      
-      if (glRes.status === 401) {
-        console.log('[SPACES] GitLab token expired or invalid');
-        return res.status(401).json({ 
-          error: 'GitLab token expired. Please reconnect GitLab.',
-          code: 'token_expired'
-        });
-      }
+      console.log('[SPACES] GitLab response type:', typeof glRes.data);
       
       if (glRes.status !== 200) {
-        console.log('[SPACES] GitLab error response:', glRes.data);
-        return res.status(glRes.status).json({ 
-          error: 'GitLab API error', 
-          details: glRes.data 
+        // If the first endpoint fails, try a different one
+        console.log('[SPACES] First endpoint failed, trying /api/v4/user/projects...');
+        
+        var glRes2 = await httpsRequest({ 
+          hostname: 'gitlab.com', 
+          path: '/api/v4/user/projects?per_page=20', 
+          method: 'GET', 
+          headers: { 
+            'Authorization': 'Bearer ' + accessToken, 
+            'Accept': 'application/json' 
+          } 
         });
+        
+        console.log('[SPACES] Second endpoint status:', glRes2.status);
+        
+        if (glRes2.status !== 200) {
+          // If both fail, try the user endpoint to verify the token
+          console.log('[SPACES] Projects endpoints failed, testing user endpoint...');
+          
+          var userRes = await httpsRequest({ 
+            hostname: 'gitlab.com', 
+            path: '/api/v4/user', 
+            method: 'GET', 
+            headers: { 
+              'Authorization': 'Bearer ' + accessToken, 
+              'Accept': 'application/json' 
+            } 
+          });
+          
+          console.log('[SPACES] User endpoint status:', userRes.status);
+          console.log('[SPACES] User data:', userRes.data);
+          
+          if (userRes.status === 200) {
+            // Token is valid but projects endpoint is failing
+            console.log('[SPACES] Token is valid but projects endpoint failed');
+            return res.status(500).json({ 
+              error: 'GitLab token is valid but could not fetch projects. You may need to create a project first.',
+              user: userRes.data.username
+            });
+          } else {
+            return res.status(401).json({ 
+              error: 'Invalid GitLab token. Please reconnect.',
+              code: 'token_invalid'
+            });
+          }
+        }
+        
+        // Use the second response
+        var projects = glRes2.data || [];
+        if (!Array.isArray(projects)) {
+          projects = [];
+        }
+        
+        console.log('[SPACES] GitLab projects (second endpoint) count:', projects.length);
+        
+        var spaces = projects.map(function(p) { 
+          return { 
+            id: String(p.id), 
+            name: p.name_with_namespace || p.name || 'Unnamed Project' 
+          }; 
+        });
+        
+        console.log('[SPACES] Returning', spaces.length, 'projects');
+        return res.json({ spaces: spaces });
       }
       
-      // Make sure we have an array
+      // Use the first response
       var projects = glRes.data || [];
       if (!Array.isArray(projects)) {
-        console.log('[SPACES] GitLab returned non-array data:', projects);
         projects = [];
       }
       
-      console.log('[SPACES] GitLab projects count:', projects.length);
+      console.log('[SPACES] GitLab projects (first endpoint) count:', projects.length);
       
       var spaces = projects.map(function(p) { 
         return { 
@@ -339,7 +383,7 @@ app.post('/spaces', async function(req, res) {
       res.json({ spaces: spaces });
       
     } else {
-      // Jira code - unchanged
+      // Jira code
       console.log('[SPACES] Fetching Jira projects...');
       var jiraRes = await httpsRequest({ 
         hostname: 'api.atlassian.com', 
@@ -378,7 +422,6 @@ app.post('/spaces', async function(req, res) {
     });
   }
 });
-
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
