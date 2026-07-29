@@ -194,16 +194,107 @@ app.post('/auth/jira/refresh', async function(req, res) {
 
 // ─── SPACES ──────────────────────────────────────────────────────────────────
 app.post('/spaces', async function(req, res) {
+  console.log('[SPACES] ===== REQUEST RECEIVED ====');
   res.header('Access-Control-Allow-Origin', '*');
-  var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
+  
+  var accessToken = req.body.accessToken;
+  var cloudId = req.body.cloudId || '';
+  var provider = req.body.provider || 'jira';
+  
+  console.log('[SPACES] Provider:', provider);
+  console.log('[SPACES] AccessToken present:', !!accessToken);
+  console.log('[SPACES] AccessToken first 20 chars:', accessToken ? accessToken.substring(0, 20) + '...' : 'none');
+  console.log('[SPACES] CloudId:', cloudId);
+  
+  if (!accessToken) {
+    console.log('[SPACES] ERROR: No access token provided');
+    return res.status(401).json({ error: 'No access token provided' });
+  }
+  
   try {
     if (provider === 'gitlab') {
-      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name_with_namespace || p.name }; }) });
+      console.log('[SPACES] Fetching GitLab projects...');
+      
+      var glRes = await httpsRequest({ 
+        hostname: 'gitlab.com', 
+        path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', 
+        method: 'GET', 
+        headers: { 
+          'Authorization': 'Bearer ' + accessToken, 
+          'Accept': 'application/json' 
+        } 
+      });
+      
+      console.log('[SPACES] GitLab response status:', glRes.status);
+      console.log('[SPACES] GitLab response data type:', typeof glRes.data);
+      
+      // Check if the response is an error
+      if (glRes.status !== 200) {
+        console.log('[SPACES] GitLab error response:', glRes.data);
+        return res.status(glRes.status).json({ 
+          error: 'GitLab API error', 
+          details: glRes.data 
+        });
+      }
+      
+      // Make sure we have an array
+      var projects = glRes.data || [];
+      if (!Array.isArray(projects)) {
+        console.log('[SPACES] GitLab returned non-array data:', projects);
+        projects = [];
+      }
+      
+      console.log('[SPACES] GitLab projects count:', projects.length);
+      
+      var spaces = projects.map(function(p) { 
+        return { 
+          id: String(p.id), 
+          name: p.name_with_namespace || p.name || 'Unnamed Project' 
+        }; 
+      });
+      
+      console.log('[SPACES] Returning', spaces.length, 'projects');
+      res.json({ spaces: spaces });
+      
+    } else {
+      // Jira code...
+      console.log('[SPACES] Fetching Jira projects...');
+      var jiraRes = await httpsRequest({ 
+        hostname: 'api.atlassian.com', 
+        path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', 
+        method: 'GET', 
+        headers: { 
+          'Authorization': 'Bearer ' + accessToken, 
+          'Accept': 'application/json' 
+        } 
+      });
+      
+      console.log('[SPACES] Jira response status:', jiraRes.status);
+      
+      if (jiraRes.status !== 200) {
+        console.log('[SPACES] Jira error response:', jiraRes.data);
+        return res.status(jiraRes.status).json({ 
+          error: 'Jira API error', 
+          details: jiraRes.data 
+        });
+      }
+      
+      var spaces = (jiraRes.data.values || []).map(function(p) { 
+        return { id: p.key, name: p.name }; 
+      });
+      
+      console.log('[SPACES] Returning', spaces.length, 'Jira projects');
+      res.json({ spaces: spaces });
     }
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-    res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    
+  } catch(e) { 
+    console.log('[SPACES] CATCH ERROR:', e.message);
+    console.log('[SPACES] Error stack:', e.stack);
+    res.status(500).json({ 
+      error: 'Server error: ' + e.message,
+      stack: e.stack 
+    });
+  }
 });
 
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
