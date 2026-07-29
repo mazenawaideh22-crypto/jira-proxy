@@ -172,9 +172,28 @@ app.get('/auth/gitlab/callback', async function(req, res) {
 app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
-  if (!code || !pendingCodes[code]) return res.status(404).json({ error: 'Invalid or expired code' });
-  if (Date.now() > pendingCodes[code].expiresAt) { delete pendingCodes[code]; return res.status(410).json({ error: 'Code expired' }); }
+  
+  console.log('[TOKEN] Code received:', code);
+  console.log('[TOKEN] Pending codes keys:', Object.keys(pendingCodes));
+  
+  if (!code || !pendingCodes[code]) {
+    console.log('[TOKEN] Invalid or expired code');
+    return res.status(404).json({ error: 'Invalid or expired code' });
+  }
+  
+  if (Date.now() > pendingCodes[code].expiresAt) { 
+    console.log('[TOKEN] Code expired');
+    delete pendingCodes[code]; 
+    return res.status(410).json({ error: 'Code expired' }); 
+  }
+  
   var data = pendingCodes[code];
+  console.log('[TOKEN] Data found:', {
+    provider: data.provider,
+    hasAccessToken: !!data.accessToken,
+    hasRefreshToken: !!data.refreshToken
+  });
+  
   delete pendingCodes[code];
   res.json(data);
 });
