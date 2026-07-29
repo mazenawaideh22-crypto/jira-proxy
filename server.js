@@ -193,17 +193,59 @@ app.post('/auth/jira/refresh', async function(req, res) {
 });
 
 // ─── SPACES ──────────────────────────────────────────────────────────────────
+// ─── SPACES ──────────────────────────────────────────────────────────────────
 app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
+  
+  if (!accessToken) {
+    return res.status(400).json({ error: 'Missing access token for ' + provider });
+  }
+
   try {
     if (provider === 'gitlab') {
-      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name_with_namespace || p.name }; }) });
+      // Safer GitLab query parameters to avoid 500 errors on certain account scopes
+      var glRes = await httpsRequest({ 
+        hostname: 'gitlab.com', 
+        path: '/api/v4/projects?simple=true&order_by=last_activity_at&per_page=20', 
+        method: 'GET', 
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+      });
+
+      if (glRes.status !== 200) {
+        return res.status(glRes.status).json({ error: 'GitLab API error', details: glRes.data });
+      }
+
+      var projects = Array.isArray(glRes.data) ? glRes.data : [];
+      return res.json({ 
+        spaces: projects.map(function(p) { 
+          return { id: String(p.id), name: p.name_with_namespace || p.name || 'Unnamed Project' }; 
+        }) 
+      });
     }
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-    res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+
+    if (!cloudId) {
+      return res.status(400).json({ error: 'Missing Jira cloudId' });
+    }
+
+    var jiraRes = await httpsRequest({ 
+      hostname: 'api.atlassian.com', 
+      path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', 
+      method: 'GET', 
+      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+    });
+
+    if (jiraRes.status !== 200) {
+      return res.status(jiraRes.status).json({ error: 'Jira API error', details: jiraRes.data });
+    }
+
+    var issuesList = (jiraRes.data && jiraRes.data.values) ? jiraRes.data.values : [];
+    res.json({ spaces: issuesList.map(function(p) { return { id: p.key, name: p.name }; }) });
+
+  } catch(e) { 
+    console.error('[SPACES ERROR] Failed to load spaces for ' + provider + ':', e.message);
+    return res.status(500).json({ error: 'Internal Server Error: ' + e.message }); 
+  }
 });
 
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
