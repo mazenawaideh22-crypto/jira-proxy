@@ -144,105 +144,37 @@ app.get('/auth/gitlab', rateLimiter(10), async function(req, res) {
   var url = 'https://gitlab.com/oauth/authorize' +
     '?client_id=' + GITLAB_CLIENT_ID +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback') +
-    '&response_type=code' +
-    '&scope=' + encodeURIComponent('api read_user') +  // ← Make sure 'api' is included
-    '&state=' + state;
+    '&response_type=code&scope=' + encodeURIComponent('api') + '&state=' + state;
   res.redirect(url);
 });
 
 app.get('/auth/gitlab/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
-  console.log('[GITLAB] Callback received, code:', code ? code.substring(0, 10) + '...' : 'none');
-  console.log('[GITLAB] State:', state);
-  
   if (!code) return res.status(400).send('<h2>Error: No code</h2>');
   if (!state || !pendingStates[state] || pendingStates[state].provider !== 'gitlab')
     return res.status(403).send('<h2>Error: Invalid or expired state.</h2>');
   delete pendingStates[state];
-  
   try {
     var body = 'client_id=' + encodeURIComponent(GITLAB_CLIENT_ID) +
       '&client_secret=' + encodeURIComponent(GITLAB_CLIENT_SECRET) +
       '&code=' + encodeURIComponent(code) +
       '&grant_type=authorization_code' +
       '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback');
-    
-    console.log('[GITLAB] Exchanging code for token...');
-    
-    var tokenRes = await httpsRequest({ 
-      hostname: 'gitlab.com', 
-      path: '/oauth/token', 
-      method: 'POST', 
-      headers: { 
-        'Content-Type': 'application/x-www-form-urlencoded', 
-        'Content-Length': Buffer.byteLength(body) 
-      } 
-    }, body);
-    
-    console.log('[GITLAB] Token response status:', tokenRes.status);
-    
-    if (!tokenRes.data.access_token) {
-      console.log('[GITLAB] No access token in response:', tokenRes.data);
-      return res.status(400).send('<h2>GitLab token error</h2>');
-    }
-    
-    console.log('[GITLAB] Access token received, first 10 chars:', tokenRes.data.access_token.substring(0, 10) + '...');
-    
-    var userRes = await httpsRequest({ 
-      hostname: 'gitlab.com', 
-      path: '/api/v4/user', 
-      method: 'GET', 
-      headers: { 
-        'Authorization': 'Bearer ' + tokenRes.data.access_token, 
-        'Accept': 'application/json' 
-      } 
-    });
-    
-    console.log('[GITLAB] User response status:', userRes.status);
-    console.log('[GITLAB] Username:', userRes.data.username);
-    
-    var pluginCode = generateCode({ 
-      provider: 'gitlab', 
-      accessToken: tokenRes.data.access_token, 
-      username: userRes.data.username, 
-      name: userRes.data.name 
-    });
-    
-    console.log('[GITLAB] Generated plugin code:', pluginCode);
+    var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
+    if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
+    var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
+    var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, username: userRes.data.username, name: userRes.data.name });
     res.send(successPage(pluginCode, 'GitLab'));
-    
-  } catch(e) { 
-    console.error('[GITLAB] Error:', e.message);
-    res.status(500).send('<h2>Error: ' + e.message + '</h2>'); 
-  }
+  } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
 
 // ─── AUTH TOKEN EXCHANGE ─────────────────────────────────────────────────────
 app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
-  
-  console.log('[TOKEN] Code received:', code);
-  console.log('[TOKEN] Pending codes keys:', Object.keys(pendingCodes));
-  
-  if (!code || !pendingCodes[code]) {
-    console.log('[TOKEN] Invalid or expired code');
-    return res.status(404).json({ error: 'Invalid or expired code' });
-  }
-  
-  if (Date.now() > pendingCodes[code].expiresAt) { 
-    console.log('[TOKEN] Code expired');
-    delete pendingCodes[code]; 
-    return res.status(410).json({ error: 'Code expired' }); 
-  }
-  
+  if (!code || !pendingCodes[code]) return res.status(404).json({ error: 'Invalid or expired code' });
+  if (Date.now() > pendingCodes[code].expiresAt) { delete pendingCodes[code]; return res.status(410).json({ error: 'Code expired' }); }
   var data = pendingCodes[code];
-  console.log('[TOKEN] Data found:', {
-    provider: data.provider,
-    hasAccessToken: !!data.accessToken,
-    hasRefreshToken: !!data.refreshToken
-  });
-  
   delete pendingCodes[code];
   res.json(data);
 });
@@ -262,173 +194,18 @@ app.post('/auth/jira/refresh', async function(req, res) {
 
 // ─── SPACES ──────────────────────────────────────────────────────────────────
 app.post('/spaces', async function(req, res) {
-  console.log('[SPACES] ===== REQUEST RECEIVED ====');
   res.header('Access-Control-Allow-Origin', '*');
-  
-  var accessToken = req.body.accessToken;
-  var cloudId = req.body.cloudId || '';
-  var provider = req.body.provider || 'jira';
-  
-  console.log('[SPACES] Provider:', provider);
-  console.log('[SPACES] AccessToken present:', !!accessToken);
-  
-  if (!accessToken) {
-    console.log('[SPACES] ERROR: No access token provided');
-    return res.status(401).json({ error: 'No access token provided' });
-  }
-  
+  var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
   try {
     if (provider === 'gitlab') {
-      console.log('[SPACES] Fetching GitLab projects...');
-      
-      // First, get the current user info to filter projects
-      var userRes = await httpsRequest({ 
-        hostname: 'gitlab.com', 
-        path: '/api/v4/user', 
-        method: 'GET', 
-        headers: { 
-          'Authorization': 'Bearer ' + accessToken, 
-          'Accept': 'application/json' 
-        } 
-      });
-      
-      console.log('[SPACES] User endpoint status:', userRes.status);
-      var currentUsername = userRes.data ? userRes.data.username : null;
-      var currentUserId = userRes.data ? userRes.data.id : null;
-      console.log('[SPACES] Current user:', currentUsername, 'ID:', currentUserId);
-      
-      // Get all projects
-      var glRes = await httpsRequest({ 
-        hostname: 'gitlab.com', 
-        path: '/api/v4/projects?per_page=100', 
-        method: 'GET', 
-        headers: { 
-          'Authorization': 'Bearer ' + accessToken, 
-          'Accept': 'application/json' 
-        } 
-      });
-      
-      console.log('[SPACES] GitLab response status:', glRes.status);
-      
-      if (glRes.status !== 200) {
-        console.log('[SPACES] GitLab error:', glRes.data);
-        return res.status(glRes.status).json({ 
-          error: 'GitLab API error', 
-          details: glRes.data 
-        });
-      }
-      
-      var allProjects = glRes.data || [];
-      if (!Array.isArray(allProjects)) {
-        allProjects = [];
-      }
-      
-      console.log('[SPACES] Total projects from API:', allProjects.length);
-      
-      // Filter projects to only show projects owned by the current user
-      var userProjects = allProjects.filter(function(p) {
-        // Check if the user is the owner
-        if (p.owner && p.owner.username === currentUsername) {
-          return true;
-        }
-        // Check if the namespace is the user's personal namespace
-        if (p.namespace && p.namespace.kind === 'user' && p.namespace.path === currentUsername) {
-          return true;
-        }
-        // Check if the user is a member (this requires api scope, but we try anyway)
-        if (p.namespace && p.namespace.kind === 'user') {
-          return true;
-        }
-        // Only include projects where the namespace is the user's personal namespace
-        if (p.namespace && p.namespace.path === currentUsername) {
-          return true;
-        }
-        return false;
-      });
-      
-      console.log('[SPACES] Filtered projects (yours):', userProjects.length);
-      
-      // If no projects found, try a different approach - check membership
-      if (userProjects.length === 0) {
-        console.log('[SPACES] No projects found via filtering, trying membership endpoint...');
-        
-        // Get projects where user is a member
-        var memberRes = await httpsRequest({ 
-          hostname: 'gitlab.com', 
-          path: '/api/v4/projects?membership=true&per_page=100', 
-          method: 'GET', 
-          headers: { 
-            'Authorization': 'Bearer ' + accessToken, 
-            'Accept': 'application/json' 
-          } 
-        });
-        
-        if (memberRes.status === 200) {
-          var memberProjects = memberRes.data || [];
-          userProjects = memberProjects;
-          console.log('[SPACES] Projects from membership endpoint:', userProjects.length);
-        }
-      }
-      
-      // If still no projects, return a helpful message
-      if (userProjects.length === 0) {
-        console.log('[SPACES] No projects found for user');
-        return res.json({ 
-          spaces: [],
-          message: 'No projects found. Create a project in GitLab first.'
-        });
-      }
-      
-      var spaces = userProjects.map(function(p) { 
-        return { 
-          id: String(p.id), 
-          name: p.name_with_namespace || p.name || 'Unnamed Project' 
-        }; 
-      });
-      
-      console.log('[SPACES] Returning', spaces.length, 'projects');
-      res.json({ spaces: spaces });
-      
-    } else {
-      // Jira code - unchanged...
-      console.log('[SPACES] Fetching Jira projects...');
-      var jiraRes = await httpsRequest({ 
-        hostname: 'api.atlassian.com', 
-        path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', 
-        method: 'GET', 
-        headers: { 
-          'Authorization': 'Bearer ' + accessToken, 
-          'Accept': 'application/json' 
-        } 
-      });
-      
-      console.log('[SPACES] Jira response status:', jiraRes.status);
-      
-      if (jiraRes.status !== 200) {
-        console.log('[SPACES] Jira error response:', jiraRes.data);
-        return res.status(jiraRes.status).json({ 
-          error: 'Jira API error', 
-          details: jiraRes.data 
-        });
-      }
-      
-      var spaces = (jiraRes.data.values || []).map(function(p) { 
-        return { id: p.key, name: p.name }; 
-      });
-      
-      console.log('[SPACES] Returning', spaces.length, 'Jira projects');
-      res.json({ spaces: spaces });
+      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name_with_namespace || p.name }; }) });
     }
-    
-  } catch(e) { 
-    console.log('[SPACES] CATCH ERROR:', e.message);
-    console.log('[SPACES] Error stack:', e.stack);
-    res.status(500).json({ 
-      error: 'Server error: ' + e.message,
-      stack: e.stack 
-    });
-  }
+    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+    res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -492,6 +269,7 @@ app.post('/test-enterprise', async function(req, res) {
   var model   = req.body.model || '';
   if (!url || !apiKey) return res.json({ ok: false, error: 'URL and API key required' });
   try {
+    // Simple test request to verify the endpoint is reachable
     var testUrl = new URL(url);
     var testRes = await httpsRequest({
       hostname: testUrl.hostname,
@@ -510,6 +288,7 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   req.socket.setTimeout(120000);
   res.setTimeout(120000);
 
+  // Log userId if present (no longer required)
   if (req.body.userId) {
     console.log('[ANALYZE] userId:', req.body.userId);
   }
@@ -518,10 +297,12 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   var userProvider = req.body.provider || 'anthropic';
   var userModel    = req.body.model    || '';
 
+  // Check if enterprise mode
   var isEnterprise = req.body.aiMode === 'enterprise';
   if (isEnterprise) {
     userApiKey = req.body.entKey || userApiKey;
     userProvider = 'enterprise';
+    // For enterprise, we use the endpoint directly
   }
 
   if (!userApiKey) return res.status(400).json({ error: 'API key required. Please add your API key in Settings.' });
@@ -565,6 +346,7 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   try {
     var r;
     
+    // Handle enterprise (self-hosted) mode
     if (isEnterprise) {
       var endpoint = req.body.entEndpoint || '';
       var entType = req.body.entType || 'azure';
@@ -572,8 +354,10 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
       
       if (!endpoint) return res.status(400).json({ error: 'Enterprise endpoint required' });
       
+      // Build the full URL for Azure OpenAI
       var fullUrl = endpoint;
       if (entType === 'azure') {
+        // Azure OpenAI format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview
         var deployment = entModel || 'gpt-4o';
         if (!fullUrl.endsWith('/')) fullUrl += '/';
         fullUrl += 'openai/deployments/' + deployment + '/chat/completions?api-version=2024-02-15-preview';
@@ -603,6 +387,7 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
       rawText = r.data.choices[0].message.content;
       
     } else {
+      // Regular BYOK mode
       if (userProvider === 'anthropic') {
         var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 16000, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] });
         r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
@@ -652,19 +437,11 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   
   var isEnterprise = req.body.aiMode === 'enterprise';
-  var userApiKey   = isEnterprise ? req.body.entKey : req.body.byokKey || '';
-  var userProvider = isEnterprise ? 'enterprise' : req.body.byokProvider || 'anthropic';
-  var userModel    = isEnterprise ? req.body.entModel : req.body.byokModel || '';
+  var userApiKey   = isEnterprise ? req.body.entKey   : req.body.byokKey   || '';
+  var userProvider = isEnterprise ? 'enterprise'      : req.body.byokProvider || 'anthropic';
+  var userModel    = req.body.byokModel || '';
   
-  // If no API key is provided, try to get it from the stored key in the request
-  if (!userApiKey && req.body.apiKey) {
-    userApiKey = req.body.apiKey;
-  }
-  
-  if (!userApiKey) {
-    console.log('[CHAT] No API key provided');
-    return res.json({ text: 'Please add your API key in Settings.', intent: 'none', suggestion: '', target: '' });
-  }
+  if (!userApiKey) return res.json({ text: 'Please add your API key in Settings.', intent: 'none', suggestion: '', target: '' });
 
   var message     = req.body.message    || '';
   var frameName   = req.body.frameName  || '';
@@ -692,6 +469,7 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
   try {
     var r;
     if (isEnterprise) {
+      // Enterprise chat
       var endpoint = req.body.entEndpoint || '';
       var entType = req.body.entType || 'azure';
       var entModel = req.body.entModel || '';
@@ -754,8 +532,8 @@ app.post('/generate-comment', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   
   var isEnterprise = req.body.aiMode === 'enterprise';
-  var userApiKey   = isEnterprise ? req.body.entKey : req.body.byokKey || '';
-  var userProvider = isEnterprise ? 'enterprise' : req.body.byokProvider || 'anthropic';
+  var userApiKey   = isEnterprise ? req.body.entKey   : req.body.byokKey   || '';
+  var userProvider = isEnterprise ? 'enterprise'      : req.body.byokProvider || 'anthropic';
   var userModel    = req.body.byokModel || '';
   var prompt       = req.body.prompt   || '';
   
