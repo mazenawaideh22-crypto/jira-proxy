@@ -150,22 +150,69 @@ app.get('/auth/gitlab', rateLimiter(10), async function(req, res) {
 
 app.get('/auth/gitlab/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
+  console.log('[GITLAB] Callback received, code:', code ? code.substring(0, 10) + '...' : 'none');
+  console.log('[GITLAB] State:', state);
+  
   if (!code) return res.status(400).send('<h2>Error: No code</h2>');
   if (!state || !pendingStates[state] || pendingStates[state].provider !== 'gitlab')
     return res.status(403).send('<h2>Error: Invalid or expired state.</h2>');
   delete pendingStates[state];
+  
   try {
     var body = 'client_id=' + encodeURIComponent(GITLAB_CLIENT_ID) +
       '&client_secret=' + encodeURIComponent(GITLAB_CLIENT_SECRET) +
       '&code=' + encodeURIComponent(code) +
       '&grant_type=authorization_code' +
       '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback');
-    var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
-    if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
-    var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-    var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, username: userRes.data.username, name: userRes.data.name });
+    
+    console.log('[GITLAB] Exchanging code for token...');
+    
+    var tokenRes = await httpsRequest({ 
+      hostname: 'gitlab.com', 
+      path: '/oauth/token', 
+      method: 'POST', 
+      headers: { 
+        'Content-Type': 'application/x-www-form-urlencoded', 
+        'Content-Length': Buffer.byteLength(body) 
+      } 
+    }, body);
+    
+    console.log('[GITLAB] Token response status:', tokenRes.status);
+    
+    if (!tokenRes.data.access_token) {
+      console.log('[GITLAB] No access token in response:', tokenRes.data);
+      return res.status(400).send('<h2>GitLab token error</h2>');
+    }
+    
+    console.log('[GITLAB] Access token received, first 10 chars:', tokenRes.data.access_token.substring(0, 10) + '...');
+    
+    var userRes = await httpsRequest({ 
+      hostname: 'gitlab.com', 
+      path: '/api/v4/user', 
+      method: 'GET', 
+      headers: { 
+        'Authorization': 'Bearer ' + tokenRes.data.access_token, 
+        'Accept': 'application/json' 
+      } 
+    });
+    
+    console.log('[GITLAB] User response status:', userRes.status);
+    console.log('[GITLAB] Username:', userRes.data.username);
+    
+    var pluginCode = generateCode({ 
+      provider: 'gitlab', 
+      accessToken: tokenRes.data.access_token, 
+      username: userRes.data.username, 
+      name: userRes.data.name 
+    });
+    
+    console.log('[GITLAB] Generated plugin code:', pluginCode);
     res.send(successPage(pluginCode, 'GitLab'));
-  } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
+    
+  } catch(e) { 
+    console.error('[GITLAB] Error:', e.message);
+    res.status(500).send('<h2>Error: ' + e.message + '</h2>'); 
+  }
 });
 
 // ─── AUTH TOKEN EXCHANGE ─────────────────────────────────────────────────────
