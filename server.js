@@ -91,18 +91,22 @@ function successPage(code, service) {
 
 function httpsRequest(options, body) {
   return new Promise(function(resolve, reject) {
-    var req = https.request(options, function(res) {
-      var data = '';
-      res.on('data', function(c) { data += c; });
-      res.on('end', function() {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch(e) { resolve({ status: res.statusCode, data: data }); }
+    try {
+      var req = https.request(options, function(res) {
+        var data = '';
+        res.on('data', function(c) { data += c; });
+        res.on('end', function() {
+          try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
+          catch(e) { resolve({ status: res.statusCode, data: data }); }
+        });
       });
-    });
-    req.setTimeout(120000, function() { req.destroy(new Error('Request timeout')); });
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
+      req.setTimeout(120000, function() { req.destroy(new Error('Request timeout')); });
+      req.on('error', reject);
+      if (body) req.write(body);
+      req.end();
+    } catch(e) {
+      reject(new Error('Request setup failed: ' + e.message));
+    }
   });
 }
 
@@ -213,29 +217,33 @@ app.post('/auth/gitlab/refresh', async function(req, res) {
 app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
+  if (!accessToken) return res.status(401).json({ error: 'No access token provided' });
   try {
     if (provider === 'gitlab') {
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
+        console.error('[SPACES] GitLab non-200 response:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
         return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
       }
       return res.json({ spaces: glRes.data.map(function(p) { return { id: String(p.id), name: p.name_with_namespace || p.name }; }) });
     }
     var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
+  if (!accessToken) return res.status(401).json({ error: 'No access token provided' });
   try {
     if (provider === 'gitlab') {
       var projectId = req.body.spaceId;
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?state=opened&per_page=30', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
+        console.error('[TICKETS] GitLab non-200 response:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
         return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
       }
       return res.json({ tickets: glRes.data.map(function(i) { return { id: String(i.iid), title: i.title, description: i.description || 'No description' }; }) });
@@ -249,7 +257,7 @@ app.post('/tickets', async function(req, res) {
       try { desc = issue.fields.description.content[0].content[0].text; } catch(e) {}
       return { id: issue.key, title: issue.fields.summary, description: desc, priority: (issue.fields.priority && issue.fields.priority.name) || '' };
     })});
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('[TICKETS] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ─── TEST CONNECTION (BYOK key validation) ───────────────────────────────────
