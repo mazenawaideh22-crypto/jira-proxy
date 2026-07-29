@@ -271,7 +271,6 @@ app.post('/spaces', async function(req, res) {
   
   console.log('[SPACES] Provider:', provider);
   console.log('[SPACES] AccessToken present:', !!accessToken);
-  console.log('[SPACES] AccessToken first 20 chars:', accessToken ? accessToken.substring(0, 20) + '...' : 'none');
   
   if (!accessToken) {
     console.log('[SPACES] ERROR: No access token provided');
@@ -282,11 +281,26 @@ app.post('/spaces', async function(req, res) {
     if (provider === 'gitlab') {
       console.log('[SPACES] Fetching GitLab projects...');
       
-      // Try a simpler endpoint that should always work
-      // First try: get user's projects (this should work with any valid token)
+      // First, get the current user info to filter projects
+      var userRes = await httpsRequest({ 
+        hostname: 'gitlab.com', 
+        path: '/api/v4/user', 
+        method: 'GET', 
+        headers: { 
+          'Authorization': 'Bearer ' + accessToken, 
+          'Accept': 'application/json' 
+        } 
+      });
+      
+      console.log('[SPACES] User endpoint status:', userRes.status);
+      var currentUsername = userRes.data ? userRes.data.username : null;
+      var currentUserId = userRes.data ? userRes.data.id : null;
+      console.log('[SPACES] Current user:', currentUsername, 'ID:', currentUserId);
+      
+      // Get all projects
       var glRes = await httpsRequest({ 
         hostname: 'gitlab.com', 
-        path: '/api/v4/projects?per_page=20', 
+        path: '/api/v4/projects?per_page=100', 
         method: 'GET', 
         headers: { 
           'Authorization': 'Bearer ' + accessToken, 
@@ -295,15 +309,53 @@ app.post('/spaces', async function(req, res) {
       });
       
       console.log('[SPACES] GitLab response status:', glRes.status);
-      console.log('[SPACES] GitLab response type:', typeof glRes.data);
       
       if (glRes.status !== 200) {
-        // If the first endpoint fails, try a different one
-        console.log('[SPACES] First endpoint failed, trying /api/v4/user/projects...');
+        console.log('[SPACES] GitLab error:', glRes.data);
+        return res.status(glRes.status).json({ 
+          error: 'GitLab API error', 
+          details: glRes.data 
+        });
+      }
+      
+      var allProjects = glRes.data || [];
+      if (!Array.isArray(allProjects)) {
+        allProjects = [];
+      }
+      
+      console.log('[SPACES] Total projects from API:', allProjects.length);
+      
+      // Filter projects to only show projects owned by the current user
+      var userProjects = allProjects.filter(function(p) {
+        // Check if the user is the owner
+        if (p.owner && p.owner.username === currentUsername) {
+          return true;
+        }
+        // Check if the namespace is the user's personal namespace
+        if (p.namespace && p.namespace.kind === 'user' && p.namespace.path === currentUsername) {
+          return true;
+        }
+        // Check if the user is a member (this requires api scope, but we try anyway)
+        if (p.namespace && p.namespace.kind === 'user') {
+          return true;
+        }
+        // Only include projects where the namespace is the user's personal namespace
+        if (p.namespace && p.namespace.path === currentUsername) {
+          return true;
+        }
+        return false;
+      });
+      
+      console.log('[SPACES] Filtered projects (yours):', userProjects.length);
+      
+      // If no projects found, try a different approach - check membership
+      if (userProjects.length === 0) {
+        console.log('[SPACES] No projects found via filtering, trying membership endpoint...');
         
-        var glRes2 = await httpsRequest({ 
+        // Get projects where user is a member
+        var memberRes = await httpsRequest({ 
           hostname: 'gitlab.com', 
-          path: '/api/v4/user/projects?per_page=20', 
+          path: '/api/v4/projects?membership=true&per_page=100', 
           method: 'GET', 
           headers: { 
             'Authorization': 'Bearer ' + accessToken, 
@@ -311,68 +363,23 @@ app.post('/spaces', async function(req, res) {
           } 
         });
         
-        console.log('[SPACES] Second endpoint status:', glRes2.status);
-        
-        if (glRes2.status !== 200) {
-          // If both fail, try the user endpoint to verify the token
-          console.log('[SPACES] Projects endpoints failed, testing user endpoint...');
-          
-          var userRes = await httpsRequest({ 
-            hostname: 'gitlab.com', 
-            path: '/api/v4/user', 
-            method: 'GET', 
-            headers: { 
-              'Authorization': 'Bearer ' + accessToken, 
-              'Accept': 'application/json' 
-            } 
-          });
-          
-          console.log('[SPACES] User endpoint status:', userRes.status);
-          console.log('[SPACES] User data:', userRes.data);
-          
-          if (userRes.status === 200) {
-            // Token is valid but projects endpoint is failing
-            console.log('[SPACES] Token is valid but projects endpoint failed');
-            return res.status(500).json({ 
-              error: 'GitLab token is valid but could not fetch projects. You may need to create a project first.',
-              user: userRes.data.username
-            });
-          } else {
-            return res.status(401).json({ 
-              error: 'Invalid GitLab token. Please reconnect.',
-              code: 'token_invalid'
-            });
-          }
+        if (memberRes.status === 200) {
+          var memberProjects = memberRes.data || [];
+          userProjects = memberProjects;
+          console.log('[SPACES] Projects from membership endpoint:', userProjects.length);
         }
-        
-        // Use the second response
-        var projects = glRes2.data || [];
-        if (!Array.isArray(projects)) {
-          projects = [];
-        }
-        
-        console.log('[SPACES] GitLab projects (second endpoint) count:', projects.length);
-        
-        var spaces = projects.map(function(p) { 
-          return { 
-            id: String(p.id), 
-            name: p.name_with_namespace || p.name || 'Unnamed Project' 
-          }; 
+      }
+      
+      // If still no projects, return a helpful message
+      if (userProjects.length === 0) {
+        console.log('[SPACES] No projects found for user');
+        return res.json({ 
+          spaces: [],
+          message: 'No projects found. Create a project in GitLab first.'
         });
-        
-        console.log('[SPACES] Returning', spaces.length, 'projects');
-        return res.json({ spaces: spaces });
       }
       
-      // Use the first response
-      var projects = glRes.data || [];
-      if (!Array.isArray(projects)) {
-        projects = [];
-      }
-      
-      console.log('[SPACES] GitLab projects (first endpoint) count:', projects.length);
-      
-      var spaces = projects.map(function(p) { 
+      var spaces = userProjects.map(function(p) { 
         return { 
           id: String(p.id), 
           name: p.name_with_namespace || p.name || 'Unnamed Project' 
@@ -383,7 +390,7 @@ app.post('/spaces', async function(req, res) {
       res.json({ spaces: spaces });
       
     } else {
-      // Jira code
+      // Jira code - unchanged...
       console.log('[SPACES] Fetching Jira projects...');
       var jiraRes = await httpsRequest({ 
         hostname: 'api.atlassian.com', 
