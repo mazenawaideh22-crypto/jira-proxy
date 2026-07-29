@@ -221,6 +221,7 @@ app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
   if (!accessToken) return res.status(401).json({ error: 'No access token provided' });
+  console.log('[SPACES] token shape - provider:', provider, 'length:', accessToken.length, 'preview:', JSON.stringify(accessToken.slice(0, 6) + '...' + accessToken.slice(-6)));
   try {
     if (provider === 'gitlab') {
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
