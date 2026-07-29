@@ -92,7 +92,10 @@ function successPage(code, service) {
 function httpsRequest(options, body) {
   return new Promise(function(resolve, reject) {
     try {
-      var req = https.request(options, function(res) {
+      var opts = Object.assign({}, options, {
+        headers: Object.assign({ 'User-Agent': 'Structify-Proxy/1.0' }, options.headers || {})
+      });
+      var req = https.request(opts, function(res) {
         var data = '';
         res.on('data', function(c) { data += c; });
         res.on('end', function() {
