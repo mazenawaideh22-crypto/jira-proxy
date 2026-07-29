@@ -217,18 +217,25 @@ app.post('/auth/gitlab/refresh', async function(req, res) {
 });
 
 // ─── SPACES ──────────────────────────────────────────────────────────────────
+// ─── SPACES ──────────────────────────────────────────────────────────────────
 app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
   if (!accessToken) return res.status(401).json({ error: 'No access token provided' });
-  console.log('[SPACES] token shape - provider:', provider, 'length:', accessToken.length, 'preview:', JSON.stringify(accessToken.slice(0, 6) + '...' + accessToken.slice(-6)));
-  console.log('[TEMP-DEBUG-REMOVE-ME] full token:', accessToken);
+  
+  // Note: The console.log containing the token was removed for your security
+  
   try {
- if (provider === 'gitlab') {
+    if (provider === 'gitlab') {
       var userId = req.body.userId;
       if (!userId) return res.status(400).json({ error: 'userId required for GitLab alternative endpoint' });
       
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+      
+      // Added missing return statement and closing brace for GitLab
+      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name }; }) });
+    }
+    
     var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
   } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
