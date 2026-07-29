@@ -170,7 +170,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
     var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-    var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name });
+  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id });
     res.send(successPage(pluginCode, 'GitLab'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
@@ -224,14 +224,11 @@ app.post('/spaces', async function(req, res) {
   console.log('[SPACES] token shape - provider:', provider, 'length:', accessToken.length, 'preview:', JSON.stringify(accessToken.slice(0, 6) + '...' + accessToken.slice(-6)));
   console.log('[TEMP-DEBUG-REMOVE-ME] full token:', accessToken);
   try {
-    if (provider === 'gitlab') {
-      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-      if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
-        console.error('[SPACES] GitLab non-200 response:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
-        return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
-      }
-      return res.json({ spaces: glRes.data.map(function(p) { return { id: String(p.id), name: p.name_with_namespace || p.name }; }) });
-    }
+ if (provider === 'gitlab') {
+      var userId = req.body.userId;
+      if (!userId) return res.status(400).json({ error: 'userId required for GitLab alternative endpoint' });
+      
+      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
     res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
   } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
