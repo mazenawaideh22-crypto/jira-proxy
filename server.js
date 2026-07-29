@@ -163,7 +163,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
     var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-    var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, username: userRes.data.username, name: userRes.data.name });
+    var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name });
     res.send(successPage(pluginCode, 'GitLab'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
@@ -192,60 +192,38 @@ app.post('/auth/jira/refresh', async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── SPACES ──────────────────────────────────────────────────────────────────
+// ─── GITLAB TOKEN REFRESH ────────────────────────────────────────────────────
+app.post('/auth/gitlab/refresh', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var refreshToken = req.body.refreshToken;
+  if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
+  try {
+    var body = 'client_id=' + encodeURIComponent(GITLAB_CLIENT_ID) +
+      '&client_secret=' + encodeURIComponent(GITLAB_CLIENT_SECRET) +
+      '&refresh_token=' + encodeURIComponent(refreshToken) +
+      '&grant_type=refresh_token' +
+      '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback');
+    var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
+    if (!tokenRes.data.access_token) return res.status(401).json({ error: 'Refresh failed', detail: tokenRes.data });
+    res.json({ accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token || refreshToken });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── SPACES ──────────────────────────────────────────────────────────────────
 app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
-  
-  if (!accessToken) {
-    return res.status(400).json({ error: 'Missing access token for ' + provider });
-  }
-
   try {
     if (provider === 'gitlab') {
-      // Safer GitLab query parameters to avoid 500 errors on certain account scopes
-      var glRes = await httpsRequest({ 
-        hostname: 'gitlab.com', 
-        path: '/api/v4/projects?simple=true&order_by=last_activity_at&per_page=20', 
-        method: 'GET', 
-        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
-      });
-
-      if (glRes.status !== 200) {
-        return res.status(glRes.status).json({ error: 'GitLab API error', details: glRes.data });
+      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+      if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
+        return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
       }
-
-      var projects = Array.isArray(glRes.data) ? glRes.data : [];
-      return res.json({ 
-        spaces: projects.map(function(p) { 
-          return { id: String(p.id), name: p.name_with_namespace || p.name || 'Unnamed Project' }; 
-        }) 
-      });
+      return res.json({ spaces: glRes.data.map(function(p) { return { id: String(p.id), name: p.name_with_namespace || p.name }; }) });
     }
-
-    if (!cloudId) {
-      return res.status(400).json({ error: 'Missing Jira cloudId' });
-    }
-
-    var jiraRes = await httpsRequest({ 
-      hostname: 'api.atlassian.com', 
-      path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', 
-      method: 'GET', 
-      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
-    });
-
-    if (jiraRes.status !== 200) {
-      return res.status(jiraRes.status).json({ error: 'Jira API error', details: jiraRes.data });
-    }
-
-    var issuesList = (jiraRes.data && jiraRes.data.values) ? jiraRes.data.values : [];
-    res.json({ spaces: issuesList.map(function(p) { return { id: p.key, name: p.name }; }) });
-
-  } catch(e) { 
-    console.error('[SPACES ERROR] Failed to load spaces for ' + provider + ':', e.message);
-    return res.status(500).json({ error: 'Internal Server Error: ' + e.message }); 
-  }
+    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+    res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
@@ -257,7 +235,10 @@ app.post('/tickets', async function(req, res) {
       var projectId = req.body.spaceId;
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?state=opened&per_page=30', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-      return res.json({ tickets: (glRes.data || []).map(function(i) { return { id: String(i.iid), title: i.title, description: i.description || 'No description' }; }) });
+      if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
+        return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
+      }
+      return res.json({ tickets: glRes.data.map(function(i) { return { id: String(i.iid), title: i.title, description: i.description || 'No description' }; }) });
     }
     var spaceId = req.body.spaceId;
     var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
