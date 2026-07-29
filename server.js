@@ -223,16 +223,20 @@ app.post('/spaces', async function(req, res) {
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
   if (!accessToken) return res.status(401).json({ error: 'No access token provided' });
   
-  // Note: The console.log containing the token was removed for your security
-  
   try {
     if (provider === 'gitlab') {
-      var userId = req.body.userId;
-      if (!userId) return res.status(400).json({ error: 'userId required for GitLab alternative endpoint' });
+      // 1. Fetch the user ID directly from GitLab using the existing access token
+      var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       
+      if (userRes.status !== 200 || !userRes.data.id) {
+         return res.status(userRes.status || 401).json({ error: 'Could not fetch GitLab user profile' });
+      }
+      
+      var userId = userRes.data.id;
+      
+      // 2. Use the retrieved userId to fetch the projects safely
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       
-      // Added missing return statement and closing brace for GitLab
       return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name }; }) });
     }
     
@@ -240,7 +244,6 @@ app.post('/spaces', async function(req, res) {
     res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
   } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
 });
-
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
