@@ -56,7 +56,7 @@ const JIRA_CLIENT_ID       = process.env.ATLASSIAN_CLIENT_ID;
 const JIRA_CLIENT_SECRET   = process.env.ATLASSIAN_CLIENT_SECRET;
 const GITLAB_CLIENT_ID     = process.env.GITLAB_CLIENT_ID;
 const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET;
-const BASE_URL             = 'https://jira-proxy-production-ec4e.up.railway.app';
+const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-production-ec4e.up.railway.app';
 
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
@@ -260,16 +260,50 @@ app.post('/test-connection', async function(req, res) {
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
 
-// ─── ANALYZE (uses user's own API key — no usage limits) ─────────────────────
+// ─── ENTERPRISE TEST CONNECTION ─────────────────────────────────────────────
+app.post('/test-enterprise', async function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var entType = req.body.entType || 'azure';
+  var url     = req.body.url || '';
+  var apiKey  = req.body.key || '';
+  var model   = req.body.model || '';
+  if (!url || !apiKey) return res.json({ ok: false, error: 'URL and API key required' });
+  try {
+    // Simple test request to verify the endpoint is reachable
+    var testUrl = new URL(url);
+    var testRes = await httpsRequest({
+      hostname: testUrl.hostname,
+      path: testUrl.pathname + '/openai/deployments/' + (model || 'gpt-4o') + '/chat/completions?api-version=2024-02-15-preview',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'api-key': apiKey }
+    }, JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 }));
+    if (testRes.status === 200 || testRes.status === 201) return res.json({ ok: true, message: 'Endpoint reachable' });
+    return res.json({ ok: false, error: 'Status ' + testRes.status });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ─── ANALYZE (uses user's own API key — no usage limits) ────────────────────
 app.post('/analyze', rateLimiter(30), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   req.socket.setTimeout(120000);
   res.setTimeout(120000);
 
-  // User provides their own API key — no subscription check needed
+  // Log userId if present (no longer required)
+  if (req.body.userId) {
+    console.log('[ANALYZE] userId:', req.body.userId);
+  }
+
   var userApiKey   = req.body.apiKey   || '';
   var userProvider = req.body.provider || 'anthropic';
   var userModel    = req.body.model    || '';
+
+  // Check if enterprise mode
+  var isEnterprise = req.body.aiMode === 'enterprise';
+  if (isEnterprise) {
+    userApiKey = req.body.entKey || userApiKey;
+    userProvider = 'enterprise';
+    // For enterprise, we use the endpoint directly
+  }
 
   if (!userApiKey) return res.status(400).json({ error: 'API key required. Please add your API key in Settings.' });
 
@@ -311,27 +345,71 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
 
   try {
     var r;
-    if (userProvider === 'anthropic') {
-      var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 16000, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] });
-      r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
-    } else if (userProvider === 'openai') {
-      var body = JSON.stringify({ model: userModel || 'gpt-4o-mini', max_tokens: 4096, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] });
-      r = await httpsRequest({ hostname: 'api.openai.com', path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + userApiKey, 'Content-Length': Buffer.byteLength(body) } }, body);
-    } else if (userProvider === 'gemini') {
-      var model = userModel || 'gemini-1.5-flash';
-      var body = JSON.stringify({ system_instruction: { parts: [{ text: systemPrompt }] }, contents: [{ parts: [{ text: userPrompt }] }] });
-      r = await httpsRequest({ hostname: 'generativelanguage.googleapis.com', path: '/v1beta/models/' + model + ':generateContent?key=' + userApiKey, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, body);
+    
+    // Handle enterprise (self-hosted) mode
+    if (isEnterprise) {
+      var endpoint = req.body.entEndpoint || '';
+      var entType = req.body.entType || 'azure';
+      var entModel = req.body.entModel || '';
+      
+      if (!endpoint) return res.status(400).json({ error: 'Enterprise endpoint required' });
+      
+      // Build the full URL for Azure OpenAI
+      var fullUrl = endpoint;
+      if (entType === 'azure') {
+        // Azure OpenAI format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview
+        var deployment = entModel || 'gpt-4o';
+        if (!fullUrl.endsWith('/')) fullUrl += '/';
+        fullUrl += 'openai/deployments/' + deployment + '/chat/completions?api-version=2024-02-15-preview';
+      }
+      
+      var urlObj = new URL(fullUrl);
+      var body = JSON.stringify({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: 4096
+      });
+      
+      r = await httpsRequest({
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': userApiKey,
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, body);
+      
+      if (r.status !== 200) return res.status(500).json({ error: 'Enterprise AI returned ' + r.status, details: r.data });
+      rawText = r.data.choices[0].message.content;
+      
     } else {
-      var body = JSON.stringify({ model: userModel || 'mistral-small', max_tokens: 4096, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] });
-      r = await httpsRequest({ hostname: 'api.mistral.ai', path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + userApiKey, 'Content-Length': Buffer.byteLength(body) } }, body);
+      // Regular BYOK mode
+      if (userProvider === 'anthropic') {
+        var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 16000, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] });
+        r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
+      } else if (userProvider === 'openai') {
+        var body = JSON.stringify({ model: userModel || 'gpt-4o-mini', max_tokens: 4096, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] });
+        r = await httpsRequest({ hostname: 'api.openai.com', path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + userApiKey, 'Content-Length': Buffer.byteLength(body) } }, body);
+      } else if (userProvider === 'gemini') {
+        var model = userModel || 'gemini-1.5-flash';
+        var body = JSON.stringify({ system_instruction: { parts: [{ text: systemPrompt }] }, contents: [{ parts: [{ text: userPrompt }] }] });
+        r = await httpsRequest({ hostname: 'generativelanguage.googleapis.com', path: '/v1beta/models/' + model + ':generateContent?key=' + userApiKey, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, body);
+      } else {
+        var body = JSON.stringify({ model: userModel || 'mistral-small', max_tokens: 4096, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] });
+        r = await httpsRequest({ hostname: 'api.mistral.ai', path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + userApiKey, 'Content-Length': Buffer.byteLength(body) } }, body);
+      }
+
+      if (r.status !== 200) return res.status(500).json({ error: 'AI returned ' + r.status, details: r.data });
+
+      var rawText;
+      if (userProvider === 'anthropic') rawText = r.data.content[0].text;
+      else if (userProvider === 'openai' || userProvider === 'mistral') rawText = r.data.choices[0].message.content;
+      else if (userProvider === 'gemini') rawText = r.data.candidates[0].content.parts[0].text;
     }
-
-    if (r.status !== 200) return res.status(500).json({ error: 'AI returned ' + r.status, details: r.data });
-
-    var rawText;
-    if (userProvider === 'anthropic') rawText = r.data.content[0].text;
-    else if (userProvider === 'openai' || userProvider === 'mistral') rawText = r.data.choices[0].message.content;
-    else if (userProvider === 'gemini') rawText = r.data.candidates[0].content.parts[0].text;
 
     rawText = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
     var start = rawText.indexOf('{'), end = rawText.lastIndexOf('}');
@@ -357,9 +435,12 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
 // ─── CHAT ────────────────────────────────────────────────────────────────────
 app.post('/chat', rateLimiter(30), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userApiKey   = req.body.apiKey   || '';
-  var userProvider = req.body.provider || 'anthropic';
-  var userModel    = req.body.model    || '';
+  
+  var isEnterprise = req.body.aiMode === 'enterprise';
+  var userApiKey   = isEnterprise ? req.body.entKey   : req.body.byokKey   || '';
+  var userProvider = isEnterprise ? 'enterprise'      : req.body.byokProvider || 'anthropic';
+  var userModel    = req.body.byokModel || '';
+  
   if (!userApiKey) return res.json({ text: 'Please add your API key in Settings.', intent: 'none', suggestion: '', target: '' });
 
   var message     = req.body.message    || '';
@@ -387,19 +468,58 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
 
   try {
     var r;
-    if (userProvider === 'anthropic') {
+    if (isEnterprise) {
+      // Enterprise chat
+      var endpoint = req.body.entEndpoint || '';
+      var entType = req.body.entType || 'azure';
+      var entModel = req.body.entModel || '';
+      
+      if (!endpoint) return res.json({ text: 'Enterprise endpoint required', intent: 'none', suggestion: '', target: '' });
+      
+      var fullUrl = endpoint;
+      if (entType === 'azure') {
+        var deployment = entModel || 'gpt-4o';
+        if (!fullUrl.endsWith('/')) fullUrl += '/';
+        fullUrl += 'openai/deployments/' + deployment + '/chat/completions?api-version=2024-02-15-preview';
+      }
+      
+      var urlObj = new URL(fullUrl);
+      var body = JSON.stringify({
+        messages: [{ role: 'system', content: systemPrompt }].concat(messages),
+        max_tokens: 500
+      });
+      
+      r = await httpsRequest({
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': userApiKey,
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, body);
+      
+      if (r.status !== 200) return res.json({ text: 'Enterprise AI error: ' + r.status, intent: 'none', suggestion: '', target: '' });
+      var raw = r.data.choices[0].message.content.trim();
+      
+    } else if (userProvider === 'anthropic') {
       var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 500, system: systemPrompt, messages: messages });
       r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
+      if (r.status !== 200) return res.json({ text: 'AI error: ' + r.status, intent: 'none', suggestion: '', target: '' });
+      var raw = r.data.content[0].text.trim();
     } else if (userProvider === 'openai') {
       var body = JSON.stringify({ model: userModel || 'gpt-4o-mini', max_tokens: 500, messages: [{ role: 'system', content: systemPrompt }].concat(messages) });
       r = await httpsRequest({ hostname: 'api.openai.com', path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + userApiKey, 'Content-Length': Buffer.byteLength(body) } }, body);
+      if (r.status !== 200) return res.json({ text: 'AI error: ' + r.status, intent: 'none', suggestion: '', target: '' });
+      var raw = r.data.choices[0].message.content.trim();
     } else {
       var body = JSON.stringify({ model: userModel || 'mistral-small', max_tokens: 500, messages: [{ role: 'system', content: systemPrompt }].concat(messages) });
       r = await httpsRequest({ hostname: 'api.mistral.ai', path: '/v1/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + userApiKey, 'Content-Length': Buffer.byteLength(body) } }, body);
+      if (r.status !== 200) return res.json({ text: 'AI error: ' + r.status, intent: 'none', suggestion: '', target: '' });
+      var raw = r.data.choices[0].message.content.trim();
     }
 
-    if (r.status !== 200) return res.json({ text: 'AI error: ' + r.status, intent: 'none', suggestion: '', target: '' });
-    var raw = userProvider === 'anthropic' ? r.data.content[0].text.trim() : r.data.choices[0].message.content.trim();
     raw = raw.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/i,'').trim();
     var parsed;
     try { parsed = JSON.parse(raw); } catch(e) { parsed = { text: raw, intent: 'none', suggestion: '', target: '' }; }
@@ -410,16 +530,53 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
 // ─── GENERATE COMMENT ────────────────────────────────────────────────────────
 app.post('/generate-comment', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userApiKey   = req.body.apiKey   || '';
-  var userProvider = req.body.provider || 'anthropic';
-  var userModel    = req.body.model    || '';
+  
+  var isEnterprise = req.body.aiMode === 'enterprise';
+  var userApiKey   = isEnterprise ? req.body.entKey   : req.body.byokKey   || '';
+  var userProvider = isEnterprise ? 'enterprise'      : req.body.byokProvider || 'anthropic';
+  var userModel    = req.body.byokModel || '';
   var prompt       = req.body.prompt   || '';
+  
   if (!prompt)     return res.status(400).json({ error: 'prompt required' });
   if (!userApiKey) return res.status(400).json({ error: 'API key required' });
 
   try {
     var r;
-    if (userProvider === 'anthropic') {
+    if (isEnterprise) {
+      var endpoint = req.body.entEndpoint || '';
+      var entType = req.body.entType || 'azure';
+      var entModel = req.body.entModel || '';
+      
+      if (!endpoint) return res.status(400).json({ error: 'Enterprise endpoint required' });
+      
+      var fullUrl = endpoint;
+      if (entType === 'azure') {
+        var deployment = entModel || 'gpt-4o';
+        if (!fullUrl.endsWith('/')) fullUrl += '/';
+        fullUrl += 'openai/deployments/' + deployment + '/chat/completions?api-version=2024-02-15-preview';
+      }
+      
+      var urlObj = new URL(fullUrl);
+      var body = JSON.stringify({
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 300
+      });
+      
+      r = await httpsRequest({
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': userApiKey,
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, body);
+      
+      if (r.status !== 200) return res.status(500).json({ error: 'Enterprise AI error: ' + r.status });
+      res.json({ comment: r.data.choices[0].message.content.trim() });
+      
+    } else if (userProvider === 'anthropic') {
       var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 300, messages: [{ role: 'user', content: prompt + '\n\nRespond with only the comment text, no preamble.' }] });
       r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
       if (r.status !== 200) return res.status(500).json({ error: 'AI error: ' + r.status });
