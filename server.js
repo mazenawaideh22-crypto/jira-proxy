@@ -246,7 +246,7 @@ app.post('/tickets', async function(req, res) {
     if (provider === 'gitlab') {
       var projectId = req.body.spaceId;
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
-      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?state=opened&per_page=30', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
         console.error('[TICKETS] GitLab non-200 response:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
         return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
