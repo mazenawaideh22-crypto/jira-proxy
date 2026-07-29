@@ -245,6 +245,7 @@ app.post('/spaces', async function(req, res) {
   } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
 });
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
+// ─── TICKETS ─────────────────────────────────────────────────────────────────
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
@@ -252,26 +253,84 @@ app.post('/tickets', async function(req, res) {
   try {
     if (provider === 'gitlab') {
       var projectId = req.body.spaceId;
+      console.log('[TICKETS] GitLab projectId:', projectId);
+      
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
-var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects?membership=true&simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+      
+      // FIX: Use the specific project ID to get its issues
+      var glRes = await httpsRequest({ 
+        hostname: 'gitlab.com', 
+        path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=50', 
+        method: 'GET', 
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+      });
+      
+      console.log('[TICKETS] GitLab response status:', glRes.status);
+      
       if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
-        console.error('[TICKETS] GitLab non-200 response:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
+        console.error('[TICKETS] GitLab error:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
         return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
       }
-      return res.json({ tickets: glRes.data.map(function(i) { return { id: String(i.iid), title: i.title, description: i.description || 'No description' }; }) });
+      
+      // Map GitLab issues to match expected format
+      var tickets = glRes.data.map(function(issue) {
+        return {
+          id: issue.iid,
+          title: issue.title,
+          description: issue.description || 'No description',
+          status: issue.state,
+          assignee: issue.assignee ? issue.assignee.name : 'Unassigned',
+          reporter: issue.author ? issue.author.name : 'Unknown',
+          created: issue.created_at ? new Date(issue.created_at).toLocaleDateString() : '',
+          milestone: issue.milestone ? issue.milestone.title : 'None',
+          labels: issue.labels ? issue.labels.join(', ') : '',
+          dueDate: issue.due_date ? new Date(issue.due_date).toLocaleDateString() : '',
+          weight: issue.weight || '-'
+        };
+      });
+      
+      return res.json({ tickets: tickets });
     }
+    
+    // Jira handling
     var spaceId = req.body.spaceId;
     var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql + '&maxResults=30&fields=summary,description,status,priority', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+    var jiraRes = await httpsRequest({ 
+      hostname: 'api.atlassian.com', 
+      path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql + '&maxResults=30&fields=summary,description,status,priority,assignee,reporter,issuetype,created', 
+      method: 'GET', 
+      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+    });
+    
     if (!jiraRes.data.issues) return res.status(500).json({ error: 'No issues', raw: jiraRes.data });
-    res.json({ tickets: jiraRes.data.issues.map(function(issue) {
+    
+    var tickets = jiraRes.data.issues.map(function(issue) {
       var desc = 'No description';
-      try { desc = issue.fields.description.content[0].content[0].text; } catch(e) {}
-      return { id: issue.key, title: issue.fields.summary, description: desc, priority: (issue.fields.priority && issue.fields.priority.name) || '' };
-    })});
-  } catch(e) { console.error('[TICKETS] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
+      try { 
+        if (issue.fields.description && issue.fields.description.content) {
+          desc = issue.fields.description.content[0].content[0].text; 
+        }
+      } catch(e) {}
+      
+      return { 
+        id: issue.key, 
+        title: issue.fields.summary, 
+        description: desc, 
+        priority: (issue.fields.priority && issue.fields.priority.name) || '',
+        status: issue.fields.status ? issue.fields.status.name : '',
+        assignee: issue.fields.assignee ? issue.fields.assignee.displayName : 'Unassigned',
+        reporter: issue.fields.reporter ? issue.fields.reporter.displayName : 'Unknown',
+        issueType: issue.fields.issuetype ? issue.fields.issuetype.name : '',
+        created: issue.fields.created ? new Date(issue.fields.created).toLocaleDateString() : ''
+      };
+    });
+    
+    res.json({ tickets: tickets });
+  } catch(e) { 
+    console.error('[TICKETS] Exception:', e.stack || e.message); 
+    res.status(500).json({ error: e.message }); 
+  }
 });
-
 // ─── TEST CONNECTION (BYOK key validation) ───────────────────────────────────
 app.post('/test-connection', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
