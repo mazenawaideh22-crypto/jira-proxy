@@ -144,7 +144,9 @@ app.get('/auth/gitlab', rateLimiter(10), async function(req, res) {
   var url = 'https://gitlab.com/oauth/authorize' +
     '?client_id=' + GITLAB_CLIENT_ID +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback') +
-    '&response_type=code&scope=' + encodeURIComponent('api') + '&state=' + state;
+    '&response_type=code' +
+    '&scope=' + encodeURIComponent('api read_user') +  // ← Make sure 'api' is included
+    '&state=' + state;
   res.redirect(url);
 });
 
@@ -281,20 +283,34 @@ app.post('/spaces', async function(req, res) {
     if (provider === 'gitlab') {
       console.log('[SPACES] Fetching GitLab projects...');
       
+      // FIX: Use the correct GitLab API endpoint
+      // Changed from /api/v4/projects?membership=true to use proper pagination and headers
       var glRes = await httpsRequest({ 
         hostname: 'gitlab.com', 
-        path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20', 
+        path: '/api/v4/projects?membership=true&order_by=last_activity_at&per_page=20&simple=true', 
         method: 'GET', 
         headers: { 
           'Authorization': 'Bearer ' + accessToken, 
-          'Accept': 'application/json' 
+          'Accept': 'application/json',
+          'User-Agent': 'Structify-Plugin/1.0'
         } 
       });
       
       console.log('[SPACES] GitLab response status:', glRes.status);
-      console.log('[SPACES] GitLab response data type:', typeof glRes.data);
       
-      // Check if the response is an error
+      // Log the actual response for debugging
+      if (glRes.status !== 200) {
+        console.log('[SPACES] GitLab response body:', JSON.stringify(glRes.data).substring(0, 500));
+      }
+      
+      if (glRes.status === 401) {
+        console.log('[SPACES] GitLab token expired or invalid');
+        return res.status(401).json({ 
+          error: 'GitLab token expired. Please reconnect GitLab.',
+          code: 'token_expired'
+        });
+      }
+      
       if (glRes.status !== 200) {
         console.log('[SPACES] GitLab error response:', glRes.data);
         return res.status(glRes.status).json({ 
@@ -323,7 +339,7 @@ app.post('/spaces', async function(req, res) {
       res.json({ spaces: spaces });
       
     } else {
-      // Jira code...
+      // Jira code - unchanged
       console.log('[SPACES] Fetching Jira projects...');
       var jiraRes = await httpsRequest({ 
         hostname: 'api.atlassian.com', 
