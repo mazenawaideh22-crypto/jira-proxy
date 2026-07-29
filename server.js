@@ -269,7 +269,6 @@ app.post('/test-enterprise', async function(req, res) {
   var model   = req.body.model || '';
   if (!url || !apiKey) return res.json({ ok: false, error: 'URL and API key required' });
   try {
-    // Simple test request to verify the endpoint is reachable
     var testUrl = new URL(url);
     var testRes = await httpsRequest({
       hostname: testUrl.hostname,
@@ -288,7 +287,6 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   req.socket.setTimeout(120000);
   res.setTimeout(120000);
 
-  // Log userId if present (no longer required)
   if (req.body.userId) {
     console.log('[ANALYZE] userId:', req.body.userId);
   }
@@ -297,12 +295,10 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   var userProvider = req.body.provider || 'anthropic';
   var userModel    = req.body.model    || '';
 
-  // Check if enterprise mode
   var isEnterprise = req.body.aiMode === 'enterprise';
   if (isEnterprise) {
     userApiKey = req.body.entKey || userApiKey;
     userProvider = 'enterprise';
-    // For enterprise, we use the endpoint directly
   }
 
   if (!userApiKey) return res.status(400).json({ error: 'API key required. Please add your API key in Settings.' });
@@ -346,7 +342,6 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   try {
     var r;
     
-    // Handle enterprise (self-hosted) mode
     if (isEnterprise) {
       var endpoint = req.body.entEndpoint || '';
       var entType = req.body.entType || 'azure';
@@ -354,10 +349,8 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
       
       if (!endpoint) return res.status(400).json({ error: 'Enterprise endpoint required' });
       
-      // Build the full URL for Azure OpenAI
       var fullUrl = endpoint;
       if (entType === 'azure') {
-        // Azure OpenAI format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview
         var deployment = entModel || 'gpt-4o';
         if (!fullUrl.endsWith('/')) fullUrl += '/';
         fullUrl += 'openai/deployments/' + deployment + '/chat/completions?api-version=2024-02-15-preview';
@@ -387,7 +380,6 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
       rawText = r.data.choices[0].message.content;
       
     } else {
-      // Regular BYOK mode
       if (userProvider === 'anthropic') {
         var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 16000, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] });
         r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
@@ -437,11 +429,19 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   
   var isEnterprise = req.body.aiMode === 'enterprise';
-  var userApiKey   = isEnterprise ? req.body.entKey   : req.body.byokKey   || '';
-  var userProvider = isEnterprise ? 'enterprise'      : req.body.byokProvider || 'anthropic';
-  var userModel    = req.body.byokModel || '';
+  var userApiKey   = isEnterprise ? req.body.entKey : req.body.byokKey || '';
+  var userProvider = isEnterprise ? 'enterprise' : req.body.byokProvider || 'anthropic';
+  var userModel    = isEnterprise ? req.body.entModel : req.body.byokModel || '';
   
-  if (!userApiKey) return res.json({ text: 'Please add your API key in Settings.', intent: 'none', suggestion: '', target: '' });
+  // If no API key is provided, try to get it from the stored key in the request
+  if (!userApiKey && req.body.apiKey) {
+    userApiKey = req.body.apiKey;
+  }
+  
+  if (!userApiKey) {
+    console.log('[CHAT] No API key provided');
+    return res.json({ text: 'Please add your API key in Settings.', intent: 'none', suggestion: '', target: '' });
+  }
 
   var message     = req.body.message    || '';
   var frameName   = req.body.frameName  || '';
@@ -469,7 +469,6 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
   try {
     var r;
     if (isEnterprise) {
-      // Enterprise chat
       var endpoint = req.body.entEndpoint || '';
       var entType = req.body.entType || 'azure';
       var entModel = req.body.entModel || '';
@@ -532,8 +531,8 @@ app.post('/generate-comment', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   
   var isEnterprise = req.body.aiMode === 'enterprise';
-  var userApiKey   = isEnterprise ? req.body.entKey   : req.body.byokKey   || '';
-  var userProvider = isEnterprise ? 'enterprise'      : req.body.byokProvider || 'anthropic';
+  var userApiKey   = isEnterprise ? req.body.entKey : req.body.byokKey || '';
+  var userProvider = isEnterprise ? 'enterprise' : req.body.byokProvider || 'anthropic';
   var userModel    = req.body.byokModel || '';
   var prompt       = req.body.prompt   || '';
   
