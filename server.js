@@ -5,11 +5,41 @@ const https   = require('https');
 const crypto  = require('crypto');
 const path    = require('path');
 const helmet  = require('helmet');
+const multer  = require('multer');
+const fs      = require('fs');
 
 const app = express();
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
+// ─── FILE UPLOAD ──────────────────────────────────────────────────────────────
+const storage = multer.diskStorage({
+  destination: function(req, file, cb) {
+    const uploadDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function(req, file, cb) {
+    const unique = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, unique + '-' + file.originalname);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: function(req, file, cb) {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf', 'text/plain'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images, PDF, and text files are allowed.'));
+    }
+  }
+});
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
 var _rateCounts = {};
@@ -37,16 +67,20 @@ setInterval(function() {
   });
 }, 5 * 60 * 1000);
 
-app.use(express.json({ limit: '10mb' }));
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'Accept'] }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS', 'DELETE', 'PUT'], allowedHeaders: ['Content-Type', 'Authorization', 'Accept'] }));
 app.options('*', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, PUT');
   res.header('Access-Control-Allow-Headers', '*');
   res.sendStatus(200);
 });
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
+
+// Serve uploaded files
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 process.on('uncaughtException', function(err) { console.error('[CRASH] uncaughtException:', err.message, err.stack); });
 process.on('unhandledRejection', function(reason) { console.error('[CRASH] unhandledRejection:', reason); });
@@ -65,6 +99,20 @@ var pendingStates = {};
 var supportTickets = [];
 var ticketIdCounter = 1;
 
+// ─── TICKET STATUS HISTORY ──────────────────────────────────────────────────
+function addStatusHistory(ticket, newStatus, adminMessage) {
+  if (!ticket.statusHistory) ticket.statusHistory = [];
+  ticket.statusHistory.push({
+    from: ticket.status,
+    to: newStatus,
+    message: adminMessage || 'Status changed',
+    timestamp: new Date().toISOString(),
+    by: 'admin'
+  });
+  ticket.status = newStatus;
+  ticket.updatedAt = new Date().toISOString();
+}
+
 setInterval(function() {
   var now = Date.now();
   Object.keys(pendingCodes).forEach(function(c)  { if (pendingCodes[c].expiresAt < now) delete pendingCodes[c]; });
@@ -72,11 +120,26 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-app.post('/api/support/tickets', express.json(), function(req, res) {
+app.post('/api/support/tickets', upload.array('attachments', 5), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var { subject, message, email, userId } = req.body;
+  var { subject, message, email, userId, priority } = req.body;
+  
   if (!subject || !message) {
     return res.status(400).json({ error: 'Subject and message are required' });
+  }
+  
+  // Handle file attachments
+  var attachments = [];
+  if (req.files && req.files.length > 0) {
+    attachments = req.files.map(function(file) {
+      return {
+        filename: file.originalname,
+        path: file.path,
+        url: BASE_URL + '/uploads/' + file.filename,
+        size: file.size,
+        mimetype: file.mimetype
+      };
+    });
   }
   
   var ticket = {
@@ -85,14 +148,17 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
     message: message.substring(0, 5000),
     email: email || 'anonymous',
     userId: userId || 'anonymous',
+    priority: priority || 'low', // high, low
     status: 'new', // new, in_progress, resolved, closed
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    replies: []
+    attachments: attachments,
+    replies: [],
+    statusHistory: []
   };
   
   supportTickets.push(ticket);
-  console.log('[SUPPORT] New ticket #' + ticket.id + ': ' + subject);
+  console.log('[SUPPORT] New ticket #' + ticket.id + ' (' + ticket.priority + ' priority): ' + subject);
   
   res.json({ success: true, ticketId: ticket.id });
 });
@@ -103,30 +169,112 @@ app.get('/api/support/tickets', function(req, res) {
   var userTickets = supportTickets.filter(function(t) { 
     return t.userId === userId || t.email === userId;
   });
+  
+  // Add status history to the response
   res.json({ tickets: userTickets });
 });
 
-app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
+app.post('/api/support/tickets/:id/reply', upload.array('attachments', 5), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
-  var { message, isAdmin } = req.body;
+  var { message, isAdmin, newStatus } = req.body;
   
   var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
   
-  ticket.replies.push({
+  // Handle file attachments for reply
+  var attachments = [];
+  if (req.files && req.files.length > 0) {
+    attachments = req.files.map(function(file) {
+      return {
+        filename: file.originalname,
+        path: file.path,
+        url: BASE_URL + '/uploads/' + file.filename,
+        size: file.size,
+        mimetype: file.mimetype,
+        isAdminReply: true
+      };
+    });
+  }
+  
+  var reply = {
     message: message,
     isAdmin: isAdmin || false,
-    createdAt: new Date().toISOString()
-  });
+    createdAt: new Date().toISOString(),
+    attachments: attachments
+  };
+  
+  ticket.replies.push(reply);
   ticket.updatedAt = new Date().toISOString();
-  if (isAdmin) ticket.status = 'in_progress';
+  
+  // Update status if requested
+  if (newStatus && newStatus !== ticket.status) {
+    addStatusHistory(ticket, newStatus, isAdmin ? 'Admin updated status' : 'User updated status');
+  } else if (isAdmin && ticket.status === 'new') {
+    addStatusHistory(ticket, 'in_progress', 'Admin started working on this ticket');
+  }
   
   res.json({ success: true });
 });
 
+// ─── ADMIN TICKET MANAGEMENT ──────────────────────────────────────────────────
+app.put('/api/admin/tickets/:id/status', express.json(), function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var adminKey = req.query.key;
+  if (adminKey !== ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  var ticketId = parseInt(req.params.id);
+  var { status, message } = req.body;
+  
+  var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  
+  if (status && status !== ticket.status) {
+    addStatusHistory(ticket, status, message || 'Status updated by admin');
+  }
+  
+  // Add a system reply
+  if (message) {
+    ticket.replies.push({
+      message: message,
+      isAdmin: true,
+      isStatusUpdate: true,
+      createdAt: new Date().toISOString(),
+      attachments: []
+    });
+  }
+  
+  res.json({ success: true, ticket: ticket });
+});
+
+app.delete('/api/admin/tickets/:id', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var adminKey = req.query.key;
+  if (adminKey !== ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  var ticketId = parseInt(req.params.id);
+  var index = supportTickets.findIndex(function(t) { return t.id === ticketId; });
+  if (index === -1) return res.status(404).json({ error: 'Ticket not found' });
+  
+  // Delete attachments
+  var ticket = supportTickets[index];
+  if (ticket.attachments) {
+    ticket.attachments.forEach(function(att) {
+      try {
+        if (fs.existsSync(att.path)) fs.unlinkSync(att.path);
+      } catch(e) {}
+    });
+  }
+  
+  supportTickets.splice(index, 1);
+  res.json({ success: true });
+});
+
 // ─── DEVELOPER TICKET DASHBOARD ──────────────────────────────────────────────
-// Simple admin page with ticket management
 app.get('/admin/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   
@@ -144,12 +292,14 @@ app.get('/admin/tickets', function(req, res) {
         button { width: 100%; padding: 12px; background: #18D4A7; border: none; border-radius: 8px; color: #07101F; font-weight: 700; font-size: 14px; cursor: pointer; }
         h1 { color: #18D4A7; margin-bottom: 8px; }
         .sub { color: #6b6b80; font-size: 14px; margin-bottom: 24px; }
+        .error { color: #ff7a90; font-size: 13px; margin-bottom: 12px; display: none; }
       </style>
       </head>
       <body>
         <div class="card">
           <h1>🔐 Admin Access</h1>
           <p class="sub">Enter the admin key to view support tickets</p>
+          <div class="error" id="errorMsg">Incorrect key. Please try again.</div>
           <input type="password" id="adminKeyInput" placeholder="Enter admin key..." onkeydown="if(event.key==='Enter')submitKey()"/>
           <button onclick="submitKey()">Access Dashboard</button>
           <script>
@@ -177,10 +327,17 @@ app.get('/admin/tickets', function(req, res) {
       .container { max-width: 1200px; margin: 0 auto; }
       .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.07); }
       .header h1 { font-size: 24px; color: #18D4A7; }
-      .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
-      .stat-card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 16px 24px; flex: 1; min-width: 120px; }
-      .stat-number { font-size: 28px; font-weight: 700; color: #18D4A7; }
+      .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 24px; }
+      .stat-card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 16px 20px; }
+      .stat-number { font-size: 28px; font-weight: 700; }
       .stat-label { font-size: 12px; color: #6b6b80; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+      .stat-new .stat-number { color: #5badff; }
+      .stat-in_progress .stat-number { color: #ffc107; }
+      .stat-resolved .stat-number { color: #18D4A7; }
+      .stat-closed .stat-number { color: #6b6b80; }
+      .stat-total .stat-number { color: #f0f0f5; }
+      .stat-high .stat-number { color: #ff4d6a; }
+      .stat-low .stat-number { color: #5badff; }
       .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
       .filter-btn { padding: 6px 16px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.1); background: transparent; color: #6b6b80; cursor: pointer; font-size: 12px; transition: all 0.2s; }
       .filter-btn:hover { border-color: #18D4A7; color: #18D4A7; }
@@ -196,8 +353,15 @@ app.get('/admin/tickets', function(req, res) {
       .status-in_progress { background: rgba(255,193,7,0.2); color: #ffc107; }
       .status-resolved { background: rgba(24,212,167,0.2); color: #18D4A7; }
       .status-closed { background: rgba(107,107,128,0.2); color: #6b6b80; }
+      .priority-badge { padding: 2px 8px; border-radius: 8px; font-size: 10px; font-weight: 600; }
+      .priority-high { background: rgba(255,77,106,0.2); color: #ff4d6a; }
+      .priority-low { background: rgba(91,173,255,0.15); color: #5badff; }
       .ticket-meta { font-size: 12px; color: #6b6b80; margin-bottom: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
-      .ticket-message { color: #a0a0b0; font-size: 13px; line-height: 1.6; margin-bottom: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+      .ticket-message { color: #a0a0b0; font-size: 13px; line-height: 1.6; margin-bottom: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; }
+      .ticket-attachments { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+      .ticket-attachment { display: flex; align-items: center; gap: 6px; padding: 4px 10px; background: rgba(255,255,255,0.05); border-radius: 6px; font-size: 11px; color: #5badff; text-decoration: none; }
+      .ticket-attachment:hover { background: rgba(255,255,255,0.1); }
+      .ticket-attachment img { width: 40px; height: 40px; object-fit: cover; border-radius: 4px; }
       .ticket-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
       .ticket-actions button { padding: 6px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: -apple-system, sans-serif; }
       .btn-reply { background: rgba(24,212,167,0.15); color: #18D4A7; border: 1px solid rgba(24,212,167,0.2); }
@@ -208,10 +372,12 @@ app.get('/admin/tickets', function(req, res) {
       .btn-close:hover { background: rgba(107,107,128,0.3); }
       .btn-delete { background: rgba(255,77,106,0.15); color: #ff7a90; }
       .btn-delete:hover { background: rgba(255,77,106,0.25); }
+      .btn-view-attachment { background: rgba(91,173,255,0.15); color: #5badff; border: 1px solid rgba(91,173,255,0.2); }
+      .btn-view-attachment:hover { background: rgba(91,173,255,0.25); }
       .reply-area { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.07); }
       .reply-area.open { display: block; }
       .reply-area textarea { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 13px; resize: vertical; min-height: 60px; font-family: -apple-system, sans-serif; margin-bottom: 8px; box-sizing: border-box; }
-      .reply-area .reply-actions { display: flex; gap: 8px; }
+      .reply-area .reply-actions { display: flex; gap: 8px; flex-wrap: wrap; }
       .reply-area .reply-actions button { padding: 6px 16px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; }
       .btn-send-reply { background: #18D4A7; color: #07101F; }
       .btn-cancel-reply { background: transparent; color: #6b6b80; border: 1px solid rgba(255,255,255,0.1); }
@@ -220,6 +386,7 @@ app.get('/admin/tickets', function(req, res) {
       .reply:last-child { border-bottom: none; }
       .reply-admin { color: #18D4A7; }
       .reply-user { color: #5badff; }
+      .reply-status { color: #ffc107; font-style: italic; }
       .reply-meta { font-size: 10px; color: #6b6b80; margin-left: 8px; }
       .empty-state { text-align: center; padding: 60px 20px; color: #6b6b80; }
       .refresh-btn { padding: 8px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: transparent; color: #6b6b80; cursor: pointer; font-size: 12px; transition: all 0.2s; }
@@ -229,11 +396,11 @@ app.get('/admin/tickets', function(req, res) {
       .dot-in_progress { background: #ffc107; }
       .dot-resolved { background: #18D4A7; }
       .dot-closed { background: #6b6b80; }
-      .logout-link { color: #6b6b80; text-decoration: none; font-size: 12px; }
-      .logout-link:hover { color: #f0f0f5; }
+      .status-history { font-size: 11px; color: #6b6b80; margin-top: 4px; }
+      .status-change { display: inline-block; padding: 2px 6px; border-radius: 4px; background: rgba(255,255,255,0.05); margin-right: 4px; }
       @media (max-width: 768px) {
         .ticket-header { flex-direction: column; align-items: flex-start; }
-        .stats { flex-direction: column; }
+        .stats { grid-template-columns: 1fr 1fr; }
       }
     </style>
   </head>
@@ -243,16 +410,17 @@ app.get('/admin/tickets', function(req, res) {
         <h1>🎫 Support Tickets</h1>
         <div style="display:flex; gap:12px; align-items:center;">
           <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
-          <a href="/admin/tickets?key=${adminKey}" class="logout-link">↺ Reload</a>
         </div>
       </div>
       
       <div class="stats" id="stats">
-        <div class="stat-card"><div class="stat-number" id="stat-total">0</div><div class="stat-label">Total</div></div>
-        <div class="stat-card"><div class="stat-number" id="stat-new">0</div><div class="stat-label">New</div></div>
-        <div class="stat-card"><div class="stat-number" id="stat-in-progress">0</div><div class="stat-label">In Progress</div></div>
-        <div class="stat-card"><div class="stat-number" id="stat-resolved">0</div><div class="stat-label">Resolved</div></div>
-        <div class="stat-card"><div class="stat-number" id="stat-closed">0</div><div class="stat-label">Closed</div></div>
+        <div class="stat-card stat-total"><div class="stat-number" id="stat-total">0</div><div class="stat-label">Total</div></div>
+        <div class="stat-card stat-new"><div class="stat-number" id="stat-new">0</div><div class="stat-label">New</div></div>
+        <div class="stat-card stat-in_progress"><div class="stat-number" id="stat-in-progress">0</div><div class="stat-label">In Progress</div></div>
+        <div class="stat-card stat-resolved"><div class="stat-number" id="stat-resolved">0</div><div class="stat-label">Resolved</div></div>
+        <div class="stat-card stat-closed"><div class="stat-number" id="stat-closed">0</div><div class="stat-label">Closed</div></div>
+        <div class="stat-card stat-high"><div class="stat-number" id="stat-high">0</div><div class="stat-label">High Priority</div></div>
+        <div class="stat-card stat-low"><div class="stat-number" id="stat-low">0</div><div class="stat-label">Low Priority</div></div>
       </div>
       
       <div class="filters">
@@ -261,6 +429,8 @@ app.get('/admin/tickets', function(req, res) {
         <button class="filter-btn" data-filter="in_progress" onclick="filterTickets('in_progress',this)">In Progress</button>
         <button class="filter-btn" data-filter="resolved" onclick="filterTickets('resolved',this)">Resolved</button>
         <button class="filter-btn" data-filter="closed" onclick="filterTickets('closed',this)">Closed</button>
+        <button class="filter-btn" data-filter="high" onclick="filterTickets('high',this)">🔴 High Priority</button>
+        <button class="filter-btn" data-filter="low" onclick="filterTickets('low',this)">🔵 Low Priority</button>
       </div>
       
       <div class="ticket-list" id="ticketList">
@@ -286,22 +456,29 @@ app.get('/admin/tickets', function(req, res) {
       }
       
       function updateStats() {
-        var stats = { total: 0, new: 0, in_progress: 0, resolved: 0, closed: 0 };
+        var stats = { total: 0, new: 0, in_progress: 0, resolved: 0, closed: 0, high: 0, low: 0 };
         allTickets.forEach(function(t) {
           stats.total++;
           if (stats[t.status] !== undefined) stats[t.status]++;
+          if (t.priority === 'high') stats.high++;
+          else stats.low++;
         });
         document.getElementById('stat-total').textContent = stats.total;
         document.getElementById('stat-new').textContent = stats['new'];
         document.getElementById('stat-in-progress').textContent = stats['in_progress'];
         document.getElementById('stat-resolved').textContent = stats['resolved'];
         document.getElementById('stat-closed').textContent = stats['closed'];
+        document.getElementById('stat-high').textContent = stats.high;
+        document.getElementById('stat-low').textContent = stats.low;
       }
       
       function renderTickets() {
         var list = document.getElementById('ticketList');
         var filtered = allTickets.filter(function(t) {
-          return currentFilter === 'all' || t.status === currentFilter;
+          if (currentFilter === 'all') return true;
+          if (currentFilter === 'high') return t.priority === 'high';
+          if (currentFilter === 'low') return t.priority === 'low';
+          return t.status === currentFilter;
         });
         
         if (filtered.length === 0) {
@@ -319,28 +496,70 @@ app.get('/admin/tickets', function(req, res) {
           };
           var statusClass = 'status-' + t.status;
           var dotClass = 'dot-' + t.status;
+          var priorityLabel = t.priority === 'high' ? '🔴 High' : '🔵 Low';
+          var priorityClass = t.priority === 'high' ? 'priority-high' : 'priority-low';
           
           html += '<div class="ticket" id="ticket-' + t.id + '">';
           html += '<div class="ticket-header">';
           html += '<span class="ticket-id">#' + t.id + '</span>';
           html += '<span class="ticket-subject">' + escapeHtml(t.subject) + '</span>';
+          html += '<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">';
+          html += '<span class="priority-badge ' + priorityClass + '">' + priorityLabel + '</span>';
           html += '<span class="ticket-status ' + statusClass + '"><span class="status-dot ' + dotClass + '"></span>' + statusLabels[t.status] + '</span>';
+          html += '</div>';
           html += '</div>';
           html += '<div class="ticket-meta">';
           html += '<span>📧 ' + escapeHtml(t.email || 'anonymous') + '</span>';
-          html += '<span>🕐 ' + new Date(t.createdAt).toLocaleString() + '</span>';
+          html += '<span>🕐 Created: ' + new Date(t.createdAt).toLocaleString() + '</span>';
           html += '<span>🔄 Updated: ' + new Date(t.updatedAt).toLocaleString() + '</span>';
           html += '</div>';
+          
+          // Status history
+          if (t.statusHistory && t.statusHistory.length > 0) {
+            html += '<div class="status-history">';
+            t.statusHistory.forEach(function(sh) {
+              html += '<span class="status-change">' + (sh.from || 'new') + ' → ' + sh.to + '</span>';
+            });
+            html += '</div>';
+          }
+          
           html += '<div class="ticket-message">' + escapeHtml(t.message) + '</div>';
+          
+          // Attachments
+          if (t.attachments && t.attachments.length > 0) {
+            html += '<div class="ticket-attachments">';
+            t.attachments.forEach(function(att) {
+              var isImage = att.mimetype && att.mimetype.startsWith('image/');
+              if (isImage) {
+                html += '<a href="' + att.url + '" target="_blank" class="ticket-attachment">';
+                html += '<img src="' + att.url + '" alt="' + att.filename + '" />';
+                html += '<span>' + att.filename + '</span>';
+                html += '</a>';
+              } else {
+                html += '<a href="' + att.url + '" target="_blank" class="ticket-attachment">';
+                html += '📎 ' + att.filename;
+                html += '</a>';
+              }
+            });
+            html += '</div>';
+          }
           
           if (t.replies && t.replies.length > 0) {
             html += '<div class="replies">';
             t.replies.forEach(function(r) {
               var label = r.isAdmin ? '👨‍💻 Support' : '👤 User';
               var cls = r.isAdmin ? 'reply-admin' : 'reply-user';
+              if (r.isStatusUpdate) {
+                cls = 'reply-status';
+                label = '📋 System';
+              }
               html += '<div class="reply ' + cls + '">';
               html += '<strong>' + label + ':</strong> ' + escapeHtml(r.message);
               html += '<span class="reply-meta">' + new Date(r.createdAt).toLocaleString() + '</span>';
+              // Reply attachments
+              if (r.attachments && r.attachments.length > 0) {
+                html += ' <span style="font-size:10px;color:#6b6b80;">📎 ' + r.attachments.length + ' file(s)</span>';
+              }
               html += '</div>';
             });
             html += '</div>';
@@ -420,25 +639,28 @@ app.get('/admin/tickets', function(req, res) {
       }
       
       function updateStatus(id, status) {
+        var messages = {
+          'resolved': 'This ticket has been resolved.',
+          'closed': 'This ticket has been closed.'
+        };
+        var msg = messages[status] || 'Status updated to: ' + status;
+        
         if (!confirm('Change ticket #' + id + ' status to "' + status + '"?')) return;
         
-        fetch('/api/support/tickets/' + id + '/reply', {
-          method: 'POST',
+        fetch('/api/admin/tickets/' + id + '/status?key=${ADMIN_KEY}', {
+          method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ 
-            message: 'Status updated to: ' + status,
-            isAdmin: true 
+            status: status,
+            message: msg
           })
         })
         .then(r => r.json())
         .then(data => {
           if (data.success) {
-            var ticket = allTickets.find(function(t) { return t.id === id; });
-            if (ticket) ticket.status = status;
-            renderTickets();
-            updateStats();
+            fetchTickets();
           } else {
-            alert('Failed to update status.');
+            alert('Failed to update status: ' + (data.error || 'unknown error'));
           }
         })
         .catch(err => alert('Error: ' + err.message));
@@ -447,20 +669,13 @@ app.get('/admin/tickets', function(req, res) {
       function deleteTicket(id) {
         if (!confirm('Delete ticket #' + id + '? This cannot be undone.')) return;
         
-        fetch('/api/support/tickets/' + id + '/reply', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            message: 'Ticket deleted by admin',
-            isAdmin: true 
-          })
+        fetch('/api/admin/tickets/' + id + '?key=${ADMIN_KEY}', {
+          method: 'DELETE'
         })
         .then(r => r.json())
         .then(data => {
           if (data.success) {
-            allTickets = allTickets.filter(function(t) { return t.id !== id; });
-            renderTickets();
-            updateStats();
+            fetchTickets();
           } else {
             alert('Failed to delete ticket.');
           }
@@ -478,19 +693,9 @@ app.get('/admin/tickets', function(req, res) {
   </html>
   `;
   
+  // Replace ${ADMIN_KEY} with actual key in the HTML
+  html = html.replace(/\$\{ADMIN_KEY\}/g, adminKey);
   res.send(html);
-});
-
-// Admin API endpoint to get all tickets (for the dashboard)
-app.get('/api/admin/tickets', function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  var adminKey = req.query.key;
-  
-  if (adminKey !== ADMIN_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  res.json({ tickets: supportTickets });
 });
 
 // ─── WHAT'S NEW ──────────────────────────────────────────────────────────────
@@ -499,8 +704,21 @@ app.get('/api/whats-new', function(req, res) {
   res.json({
     updates: [
       {
-        version: '1.1.0',
+        version: '1.2.0',
         date: '2026-07-30',
+        title: 'Support System Improvements',
+        items: [
+          'Added priority levels (High/Low) for tickets',
+          'File and image attachments support',
+          'Status history tracking',
+          'Admin replies now visible to clients',
+          'Fixed Apple Watch display issues',
+          'Fixed history view functionality'
+        ]
+      },
+      {
+        version: '1.1.0',
+        date: '2026-07-29',
         title: 'Support System & Bug Fixes',
         items: [
           'Added in-app support ticket system',
@@ -638,21 +856,18 @@ app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
   
-  // Check if code exists
   if (!code) {
     return res.status(400).json({ 
       error: 'No code provided. Please enter the 6-digit code from your browser.' 
     });
   }
   
-  // Check if code is valid
   if (!pendingCodes[code]) {
     return res.status(404).json({ 
       error: '❌ Invalid code. Please make sure you entered the correct 6-digit code from your browser window.' 
     });
   }
   
-  // Check if code has expired
   if (Date.now() > pendingCodes[code].expiresAt) { 
     delete pendingCodes[code]; 
     return res.status(410).json({ 
