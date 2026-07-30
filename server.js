@@ -37,7 +37,7 @@ setInterval(function() {
   });
 }, 5 * 60 * 1000);
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'Accept'] }));
 app.options('*', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -61,12 +61,100 @@ const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-product
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
 var pendingStates = {};
+var supportTickets = [];
+var ticketIdCounter = 1;
 
 setInterval(function() {
   var now = Date.now();
   Object.keys(pendingCodes).forEach(function(c)  { if (pendingCodes[c].expiresAt < now) delete pendingCodes[c]; });
   Object.keys(pendingStates).forEach(function(s) { if (now - pendingStates[s].createdAt > 10 * 60 * 1000) delete pendingStates[s]; });
 }, 60000);
+
+// ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
+app.post('/api/support/tickets', express.json(), function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var { subject, message, email, userId } = req.body;
+  if (!subject || !message) {
+    return res.status(400).json({ error: 'Subject and message are required' });
+  }
+  
+  var ticket = {
+    id: ticketIdCounter++,
+    subject: subject.substring(0, 200),
+    message: message.substring(0, 5000),
+    email: email || 'anonymous',
+    userId: userId || 'anonymous',
+    status: 'new', // new, in_progress, resolved, closed
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    replies: []
+  };
+  
+  supportTickets.push(ticket);
+  console.log('[SUPPORT] New ticket #' + ticket.id + ': ' + subject);
+  
+  res.json({ success: true, ticketId: ticket.id });
+});
+
+app.get('/api/support/tickets', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var userId = req.query.userId || 'anonymous';
+  var userTickets = supportTickets.filter(function(t) { 
+    return t.userId === userId || t.email === userId;
+  });
+  res.json({ tickets: userTickets });
+});
+
+app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var ticketId = parseInt(req.params.id);
+  var { message, isAdmin } = req.body;
+  
+  var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
+  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  
+  ticket.replies.push({
+    message: message,
+    isAdmin: isAdmin || false,
+    createdAt: new Date().toISOString()
+  });
+  ticket.updatedAt = new Date().toISOString();
+  if (isAdmin) ticket.status = 'in_progress';
+  
+  res.json({ success: true });
+});
+
+// ─── WHAT'S NEW ──────────────────────────────────────────────────────────────
+app.get('/api/whats-new', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.json({
+    updates: [
+      {
+        version: '1.1.0',
+        date: '2026-07-30',
+        title: 'Support System & Bug Fixes',
+        items: [
+          'Added in-app support ticket system',
+          'Fixed code validation error messages',
+          'Fixed Apple Watch display issues',
+          'Improved history view & reuse functionality',
+          'Added What\'s New, Help & Support, and Privacy Policy pages'
+        ]
+      },
+      {
+        version: '1.0.0',
+        date: '2026-07-15',
+        title: 'Initial Release',
+        items: [
+          'Jira and GitLab integration',
+          'AI-powered design structure generation',
+          'Figma plugin with real-time editing',
+          'BYOK support for OpenAI, Anthropic, Gemini'
+        ]
+      }
+    ]
+  });
+});
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function generateCode(data) {
@@ -179,8 +267,13 @@ app.get('/auth/gitlab/callback', async function(req, res) {
 app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
-  if (!code || !pendingCodes[code]) return res.status(404).json({ error: 'Invalid or expired code' });
-  if (Date.now() > pendingCodes[code].expiresAt) { delete pendingCodes[code]; return res.status(410).json({ error: 'Code expired' }); }
+  if (!code || !pendingCodes[code]) {
+    return res.status(404).json({ error: 'Invalid or expired code. Please generate a new code.' });
+  }
+  if (Date.now() > pendingCodes[code].expiresAt) { 
+    delete pendingCodes[code]; 
+    return res.status(410).json({ error: 'Code expired. Please generate a new code.' }); 
+  }
   var data = pendingCodes[code];
   delete pendingCodes[code];
   res.json(data);
@@ -217,7 +310,6 @@ app.post('/auth/gitlab/refresh', async function(req, res) {
 });
 
 // ─── SPACES ──────────────────────────────────────────────────────────────────
-// ─── SPACES ──────────────────────────────────────────────────────────────────
 app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
@@ -225,7 +317,6 @@ app.post('/spaces', async function(req, res) {
   
   try {
     if (provider === 'gitlab') {
-      // 1. Fetch the user ID directly from GitLab using the existing access token
       var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       
       if (userRes.status !== 200 || !userRes.data.id) {
@@ -234,7 +325,6 @@ app.post('/spaces', async function(req, res) {
       
       var userId = userRes.data.id;
       
-      // 2. Use the retrieved userId to fetch the projects safely
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       
       return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name, webUrl: p.web_url || '' }; }) });
@@ -244,7 +334,7 @@ app.post('/spaces', async function(req, res) {
     res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
   } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
 });
-// ─── TICKETS ─────────────────────────────────────────────────────────────────
+
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -257,7 +347,6 @@ app.post('/tickets', async function(req, res) {
       
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
       
-      // FIX: Use the specific project ID to get its issues
       var glRes = await httpsRequest({ 
         hostname: 'gitlab.com', 
         path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=50', 
@@ -272,7 +361,6 @@ app.post('/tickets', async function(req, res) {
         return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
       }
       
-      // Map GitLab issues to match expected format
       var tickets = glRes.data.map(function(issue) {
         return {
           id: issue.iid,
@@ -285,14 +373,14 @@ app.post('/tickets', async function(req, res) {
           milestone: issue.milestone ? issue.milestone.title : 'None',
           labels: issue.labels ? issue.labels.join(', ') : '',
           dueDate: issue.due_date ? new Date(issue.due_date).toLocaleDateString() : '',
-          weight: issue.weight || '-'
+          weight: issue.weight || '-',
+          issueType: issue.issue_type || 'issue'
         };
       });
       
       return res.json({ tickets: tickets });
     }
     
-    // Jira handling
     var spaceId = req.body.spaceId;
     var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
     var jiraRes = await httpsRequest({ 
@@ -331,7 +419,8 @@ app.post('/tickets', async function(req, res) {
     res.status(500).json({ error: e.message }); 
   }
 });
-// ─── TEST CONNECTION (BYOK key validation) ───────────────────────────────────
+
+// ─── TEST CONNECTION ─────────────────────────────────────────────────────────
 app.post('/test-connection', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var provider = req.body.provider || 'anthropic';
@@ -371,7 +460,6 @@ app.post('/test-enterprise', async function(req, res) {
   var model   = req.body.model || '';
   if (!url || !apiKey) return res.json({ ok: false, error: 'URL and API key required' });
   try {
-    // Simple test request to verify the endpoint is reachable
     var testUrl = new URL(url);
     var testRes = await httpsRequest({
       hostname: testUrl.hostname,
@@ -384,13 +472,12 @@ app.post('/test-enterprise', async function(req, res) {
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
 
-// ─── ANALYZE (uses user's own API key — no usage limits) ────────────────────
+// ─── ANALYZE ─────────────────────────────────────────────────────────────────
 app.post('/analyze', rateLimiter(30), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   req.socket.setTimeout(120000);
   res.setTimeout(120000);
 
-  // Log userId if present (no longer required)
   if (req.body.userId) {
     console.log('[ANALYZE] userId:', req.body.userId);
   }
@@ -399,12 +486,10 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   var userProvider = req.body.provider || 'anthropic';
   var userModel    = req.body.model    || '';
 
-  // Check if enterprise mode
   var isEnterprise = req.body.aiMode === 'enterprise';
   if (isEnterprise) {
     userApiKey = req.body.entKey || userApiKey;
     userProvider = 'enterprise';
-    // For enterprise, we use the endpoint directly
   }
 
   if (!userApiKey) return res.status(400).json({ error: 'API key required. Please add your API key in Settings.' });
@@ -448,7 +533,6 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
   try {
     var r;
     
-    // Handle enterprise (self-hosted) mode
     if (isEnterprise) {
       var endpoint = req.body.entEndpoint || '';
       var entType = req.body.entType || 'azure';
@@ -456,10 +540,8 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
       
       if (!endpoint) return res.status(400).json({ error: 'Enterprise endpoint required' });
       
-      // Build the full URL for Azure OpenAI
       var fullUrl = endpoint;
       if (entType === 'azure') {
-        // Azure OpenAI format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview
         var deployment = entModel || 'gpt-4o';
         if (!fullUrl.endsWith('/')) fullUrl += '/';
         fullUrl += 'openai/deployments/' + deployment + '/chat/completions?api-version=2024-02-15-preview';
@@ -489,7 +571,6 @@ app.post('/analyze', rateLimiter(30), async function(req, res) {
       rawText = r.data.choices[0].message.content;
       
     } else {
-      // Regular BYOK mode
       if (userProvider === 'anthropic') {
         var body = JSON.stringify({ model: userModel || 'claude-haiku-4-5-20251001', max_tokens: 16000, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] });
         r = await httpsRequest({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': userApiKey, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) } }, body);
@@ -571,7 +652,6 @@ app.post('/chat', rateLimiter(30), async function(req, res) {
   try {
     var r;
     if (isEnterprise) {
-      // Enterprise chat
       var endpoint = req.body.entEndpoint || '';
       var entType = req.body.entType || 'azure';
       var entModel = req.body.entModel || '';
@@ -694,7 +774,7 @@ app.post('/generate-comment', rateLimiter(20), async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── COMMENT (post to Jira/GitLab) ───────────────────────────────────────────
+// ─── COMMENT ─────────────────────────────────────────────────────────────────
 app.post('/comment', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId || '', ticketId = req.body.ticketId || '', comment = req.body.comment || '', provider = req.body.provider || 'jira', spaceId = req.body.spaceId || '';
