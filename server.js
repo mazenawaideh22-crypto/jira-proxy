@@ -57,6 +57,7 @@ const JIRA_CLIENT_SECRET   = process.env.ATLASSIAN_CLIENT_SECRET;
 const GITLAB_CLIENT_ID     = process.env.GITLAB_CLIENT_ID;
 const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET;
 const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-production-ec4e.up.railway.app';
+const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
 
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
@@ -124,6 +125,374 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   res.json({ success: true });
 });
 
+// ─── DEVELOPER TICKET DASHBOARD ──────────────────────────────────────────────
+// Simple admin page with ticket management
+app.get('/admin/tickets', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  
+  var adminKey = req.query.key;
+  
+  if (adminKey !== ADMIN_KEY) {
+    return res.status(401).send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Admin Access</title>
+      <style>
+        body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 400px; width: 90%; }
+        input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 14px; margin-bottom: 12px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #18D4A7; border: none; border-radius: 8px; color: #07101F; font-weight: 700; font-size: 14px; cursor: pointer; }
+        h1 { color: #18D4A7; margin-bottom: 8px; }
+        .sub { color: #6b6b80; font-size: 14px; margin-bottom: 24px; }
+      </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>🔐 Admin Access</h1>
+          <p class="sub">Enter the admin key to view support tickets</p>
+          <input type="password" id="adminKeyInput" placeholder="Enter admin key..." onkeydown="if(event.key==='Enter')submitKey()"/>
+          <button onclick="submitKey()">Access Dashboard</button>
+          <script>
+            function submitKey() {
+              var key = document.getElementById('adminKeyInput').value.trim();
+              if (key) window.location.href = '/admin/tickets?key=' + encodeURIComponent(key);
+            }
+          </script>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+  
+  // Admin dashboard HTML
+  var html = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>Support Ticket Dashboard</title>
+    <meta charset="UTF-8">
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0a0a0f; color: #f0f0f5; padding: 20px; }
+      .container { max-width: 1200px; margin: 0 auto; }
+      .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+      .header h1 { font-size: 24px; color: #18D4A7; }
+      .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+      .stat-card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 16px 24px; flex: 1; min-width: 120px; }
+      .stat-number { font-size: 28px; font-weight: 700; color: #18D4A7; }
+      .stat-label { font-size: 12px; color: #6b6b80; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+      .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+      .filter-btn { padding: 6px 16px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.1); background: transparent; color: #6b6b80; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+      .filter-btn:hover { border-color: #18D4A7; color: #18D4A7; }
+      .filter-btn.active { background: #18D4A7; color: #07101F; border-color: #18D4A7; }
+      .ticket-list { display: flex; flex-direction: column; gap: 12px; }
+      .ticket { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 16px 20px; transition: border-color 0.2s; }
+      .ticket:hover { border-color: rgba(24,212,167,0.3); }
+      .ticket-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }
+      .ticket-id { font-weight: 700; color: #18D4A7; font-size: 14px; }
+      .ticket-subject { font-weight: 600; color: #f0f0f5; font-size: 15px; flex: 1; }
+      .ticket-status { padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+      .status-new { background: rgba(38,132,255,0.2); color: #5badff; }
+      .status-in_progress { background: rgba(255,193,7,0.2); color: #ffc107; }
+      .status-resolved { background: rgba(24,212,167,0.2); color: #18D4A7; }
+      .status-closed { background: rgba(107,107,128,0.2); color: #6b6b80; }
+      .ticket-meta { font-size: 12px; color: #6b6b80; margin-bottom: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
+      .ticket-message { color: #a0a0b0; font-size: 13px; line-height: 1.6; margin-bottom: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+      .ticket-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .ticket-actions button { padding: 6px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: -apple-system, sans-serif; }
+      .btn-reply { background: rgba(24,212,167,0.15); color: #18D4A7; border: 1px solid rgba(24,212,167,0.2); }
+      .btn-reply:hover { background: rgba(24,212,167,0.25); }
+      .btn-resolve { background: rgba(24,212,167,0.2); color: #18D4A7; }
+      .btn-resolve:hover { background: rgba(24,212,167,0.3); }
+      .btn-close { background: rgba(107,107,128,0.2); color: #6b6b80; }
+      .btn-close:hover { background: rgba(107,107,128,0.3); }
+      .btn-delete { background: rgba(255,77,106,0.15); color: #ff7a90; }
+      .btn-delete:hover { background: rgba(255,77,106,0.25); }
+      .reply-area { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.07); }
+      .reply-area.open { display: block; }
+      .reply-area textarea { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 13px; resize: vertical; min-height: 60px; font-family: -apple-system, sans-serif; margin-bottom: 8px; box-sizing: border-box; }
+      .reply-area .reply-actions { display: flex; gap: 8px; }
+      .reply-area .reply-actions button { padding: 6px 16px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; }
+      .btn-send-reply { background: #18D4A7; color: #07101F; }
+      .btn-cancel-reply { background: transparent; color: #6b6b80; border: 1px solid rgba(255,255,255,0.1); }
+      .replies { margin-top: 8px; padding: 8px 12px; background: rgba(255,255,255,0.02); border-radius: 8px; }
+      .reply { font-size: 12px; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+      .reply:last-child { border-bottom: none; }
+      .reply-admin { color: #18D4A7; }
+      .reply-user { color: #5badff; }
+      .reply-meta { font-size: 10px; color: #6b6b80; margin-left: 8px; }
+      .empty-state { text-align: center; padding: 60px 20px; color: #6b6b80; }
+      .refresh-btn { padding: 8px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: transparent; color: #6b6b80; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+      .refresh-btn:hover { border-color: #18D4A7; color: #18D4A7; }
+      .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+      .dot-new { background: #5badff; }
+      .dot-in_progress { background: #ffc107; }
+      .dot-resolved { background: #18D4A7; }
+      .dot-closed { background: #6b6b80; }
+      .logout-link { color: #6b6b80; text-decoration: none; font-size: 12px; }
+      .logout-link:hover { color: #f0f0f5; }
+      @media (max-width: 768px) {
+        .ticket-header { flex-direction: column; align-items: flex-start; }
+        .stats { flex-direction: column; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>🎫 Support Tickets</h1>
+        <div style="display:flex; gap:12px; align-items:center;">
+          <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+          <a href="/admin/tickets?key=${adminKey}" class="logout-link">↺ Reload</a>
+        </div>
+      </div>
+      
+      <div class="stats" id="stats">
+        <div class="stat-card"><div class="stat-number" id="stat-total">0</div><div class="stat-label">Total</div></div>
+        <div class="stat-card"><div class="stat-number" id="stat-new">0</div><div class="stat-label">New</div></div>
+        <div class="stat-card"><div class="stat-number" id="stat-in-progress">0</div><div class="stat-label">In Progress</div></div>
+        <div class="stat-card"><div class="stat-number" id="stat-resolved">0</div><div class="stat-label">Resolved</div></div>
+        <div class="stat-card"><div class="stat-number" id="stat-closed">0</div><div class="stat-label">Closed</div></div>
+      </div>
+      
+      <div class="filters">
+        <button class="filter-btn active" data-filter="all" onclick="filterTickets('all',this)">All</button>
+        <button class="filter-btn" data-filter="new" onclick="filterTickets('new',this)">New</button>
+        <button class="filter-btn" data-filter="in_progress" onclick="filterTickets('in_progress',this)">In Progress</button>
+        <button class="filter-btn" data-filter="resolved" onclick="filterTickets('resolved',this)">Resolved</button>
+        <button class="filter-btn" data-filter="closed" onclick="filterTickets('closed',this)">Closed</button>
+      </div>
+      
+      <div class="ticket-list" id="ticketList">
+        <div class="empty-state">Loading tickets...</div>
+      </div>
+    </div>
+    
+    <script>
+      var allTickets = [];
+      var currentFilter = 'all';
+      
+      function fetchTickets() {
+        fetch('/api/support/tickets')
+          .then(r => r.json())
+          .then(data => {
+            allTickets = data.tickets || [];
+            updateStats();
+            renderTickets();
+          })
+          .catch(err => {
+            document.getElementById('ticketList').innerHTML = '<div class="empty-state">❌ Failed to load tickets: ' + err.message + '</div>';
+          });
+      }
+      
+      function updateStats() {
+        var stats = { total: 0, new: 0, in_progress: 0, resolved: 0, closed: 0 };
+        allTickets.forEach(function(t) {
+          stats.total++;
+          if (stats[t.status] !== undefined) stats[t.status]++;
+        });
+        document.getElementById('stat-total').textContent = stats.total;
+        document.getElementById('stat-new').textContent = stats['new'];
+        document.getElementById('stat-in-progress').textContent = stats['in_progress'];
+        document.getElementById('stat-resolved').textContent = stats['resolved'];
+        document.getElementById('stat-closed').textContent = stats['closed'];
+      }
+      
+      function renderTickets() {
+        var list = document.getElementById('ticketList');
+        var filtered = allTickets.filter(function(t) {
+          return currentFilter === 'all' || t.status === currentFilter;
+        });
+        
+        if (filtered.length === 0) {
+          list.innerHTML = '<div class="empty-state">No tickets found.</div>';
+          return;
+        }
+        
+        var html = '';
+        filtered.forEach(function(t) {
+          var statusLabels = {
+            'new': 'New',
+            'in_progress': 'In Progress',
+            'resolved': 'Resolved',
+            'closed': 'Closed'
+          };
+          var statusClass = 'status-' + t.status;
+          var dotClass = 'dot-' + t.status;
+          
+          html += '<div class="ticket" id="ticket-' + t.id + '">';
+          html += '<div class="ticket-header">';
+          html += '<span class="ticket-id">#' + t.id + '</span>';
+          html += '<span class="ticket-subject">' + escapeHtml(t.subject) + '</span>';
+          html += '<span class="ticket-status ' + statusClass + '"><span class="status-dot ' + dotClass + '"></span>' + statusLabels[t.status] + '</span>';
+          html += '</div>';
+          html += '<div class="ticket-meta">';
+          html += '<span>📧 ' + escapeHtml(t.email || 'anonymous') + '</span>';
+          html += '<span>🕐 ' + new Date(t.createdAt).toLocaleString() + '</span>';
+          html += '<span>🔄 Updated: ' + new Date(t.updatedAt).toLocaleString() + '</span>';
+          html += '</div>';
+          html += '<div class="ticket-message">' + escapeHtml(t.message) + '</div>';
+          
+          if (t.replies && t.replies.length > 0) {
+            html += '<div class="replies">';
+            t.replies.forEach(function(r) {
+              var label = r.isAdmin ? '👨‍💻 Support' : '👤 User';
+              var cls = r.isAdmin ? 'reply-admin' : 'reply-user';
+              html += '<div class="reply ' + cls + '">';
+              html += '<strong>' + label + ':</strong> ' + escapeHtml(r.message);
+              html += '<span class="reply-meta">' + new Date(r.createdAt).toLocaleString() + '</span>';
+              html += '</div>';
+            });
+            html += '</div>';
+          }
+          
+          html += '<div class="ticket-actions">';
+          html += '<button class="btn-reply" onclick="toggleReply(' + t.id + ')">💬 Reply</button>';
+          if (t.status !== 'resolved') {
+            html += '<button class="btn-resolve" onclick="updateStatus(' + t.id + ',\\'resolved\\')">✓ Resolve</button>';
+          }
+          if (t.status !== 'closed') {
+            html += '<button class="btn-close" onclick="updateStatus(' + t.id + ',\\'closed\\')">✕ Close</button>';
+          }
+          if (t.status === 'new' || t.status === 'in_progress') {
+            html += '<button class="btn-delete" onclick="deleteTicket(' + t.id + ')">🗑 Delete</button>';
+          }
+          html += '</div>';
+          
+          html += '<div class="reply-area" id="reply-area-' + t.id + '">';
+          html += '<textarea id="reply-text-' + t.id + '" placeholder="Type your reply..."></textarea>';
+          html += '<div class="reply-actions">';
+          html += '<button class="btn-send-reply" onclick="sendReply(' + t.id + ')">Send Reply</button>';
+          html += '<button class="btn-cancel-reply" onclick="toggleReply(' + t.id + ')">Cancel</button>';
+          html += '</div>';
+          html += '</div>';
+          
+          html += '</div>';
+        });
+        
+        list.innerHTML = html;
+      }
+      
+      function escapeHtml(text) {
+        if (!text) return '';
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }
+      
+      function filterTickets(filter, btn) {
+        currentFilter = filter;
+        document.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
+        if (btn) btn.classList.add('active');
+        renderTickets();
+      }
+      
+      function toggleReply(id) {
+        var area = document.getElementById('reply-area-' + id);
+        if (area) {
+          area.classList.toggle('open');
+          if (area.classList.contains('open')) {
+            document.getElementById('reply-text-' + id).focus();
+          }
+        }
+      }
+      
+      function sendReply(id) {
+        var text = document.getElementById('reply-text-' + id).value.trim();
+        if (!text) { alert('Please enter a reply.'); return; }
+        
+        fetch('/api/support/tickets/' + id + '/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, isAdmin: true })
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            document.getElementById('reply-text-' + id).value = '';
+            document.getElementById('reply-area-' + id).classList.remove('open');
+            fetchTickets();
+          } else {
+            alert('Failed to send reply: ' + (data.error || 'unknown error'));
+          }
+        })
+        .catch(err => alert('Error: ' + err.message));
+      }
+      
+      function updateStatus(id, status) {
+        if (!confirm('Change ticket #' + id + ' status to "' + status + '"?')) return;
+        
+        fetch('/api/support/tickets/' + id + '/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            message: 'Status updated to: ' + status,
+            isAdmin: true 
+          })
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            var ticket = allTickets.find(function(t) { return t.id === id; });
+            if (ticket) ticket.status = status;
+            renderTickets();
+            updateStats();
+          } else {
+            alert('Failed to update status.');
+          }
+        })
+        .catch(err => alert('Error: ' + err.message));
+      }
+      
+      function deleteTicket(id) {
+        if (!confirm('Delete ticket #' + id + '? This cannot be undone.')) return;
+        
+        fetch('/api/support/tickets/' + id + '/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            message: 'Ticket deleted by admin',
+            isAdmin: true 
+          })
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            allTickets = allTickets.filter(function(t) { return t.id !== id; });
+            renderTickets();
+            updateStats();
+          } else {
+            alert('Failed to delete ticket.');
+          }
+        })
+        .catch(err => alert('Error: ' + err.message));
+      }
+      
+      // Auto-refresh every 30 seconds
+      setInterval(fetchTickets, 30000);
+      
+      // Initial load
+      fetchTickets();
+    </script>
+  </body>
+  </html>
+  `;
+  
+  res.send(html);
+});
+
+// Admin API endpoint to get all tickets (for the dashboard)
+app.get('/api/admin/tickets', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var adminKey = req.query.key;
+  
+  if (adminKey !== ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  res.json({ tickets: supportTickets });
+});
+
 // ─── WHAT'S NEW ──────────────────────────────────────────────────────────────
 app.get('/api/whats-new', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -138,7 +507,8 @@ app.get('/api/whats-new', function(req, res) {
           'Fixed code validation error messages',
           'Fixed Apple Watch display issues',
           'Improved history view & reuse functionality',
-          'Added What\'s New, Help & Support, and Privacy Policy pages'
+          'Added What\'s New, Help & Support, and Privacy Policy pages',
+          'Admin dashboard for managing support tickets'
         ]
       },
       {
@@ -267,13 +637,29 @@ app.get('/auth/gitlab/callback', async function(req, res) {
 app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
-  if (!code || !pendingCodes[code]) {
-    return res.status(404).json({ error: 'Invalid or expired code. Please generate a new code.' });
+  
+  // Check if code exists
+  if (!code) {
+    return res.status(400).json({ 
+      error: 'No code provided. Please enter the 6-digit code from your browser.' 
+    });
   }
+  
+  // Check if code is valid
+  if (!pendingCodes[code]) {
+    return res.status(404).json({ 
+      error: '❌ Invalid code. Please make sure you entered the correct 6-digit code from your browser window.' 
+    });
+  }
+  
+  // Check if code has expired
   if (Date.now() > pendingCodes[code].expiresAt) { 
     delete pendingCodes[code]; 
-    return res.status(410).json({ error: 'Code expired. Please generate a new code.' }); 
+    return res.status(410).json({ 
+      error: '⏰ Code expired. Please click "Open browser again" to get a new code.' 
+    }); 
   }
+  
   var data = pendingCodes[code];
   delete pendingCodes[code];
   res.json(data);
@@ -800,4 +1186,5 @@ app.post('/comment', async function(req, res) {
 var PORT = process.env.PORT || 8080;
 app.listen(PORT, function() {
   console.log('Structify (free/BYOK) server running on port ' + PORT);
+  console.log('Admin dashboard available at: ' + BASE_URL + '/admin/tickets?key=' + ADMIN_KEY);
 });
