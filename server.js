@@ -237,7 +237,7 @@ app.post('/spaces', async function(req, res) {
       // 2. Use the retrieved userId to fetch the projects safely
       var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
       
-      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name }; }) });
+      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name, webUrl: p.web_url || '' }; }) });
     }
     
     var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
