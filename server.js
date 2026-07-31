@@ -37,11 +37,11 @@ setInterval(function() {
   });
 }, 5 * 60 * 1000);
 
-app.use(express.json({ limit: '50mb' })); // Increased to allow file attachments
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'Accept'] }));
+app.use(express.json({ limit: '50mb' }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'Accept'] }));
 app.options('*', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
   res.header('Access-Control-Allow-Headers', '*');
   res.sendStatus(200);
 });
@@ -72,7 +72,6 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-// In the support tickets section, ensure userId is properly stored
 app.post('/api/support/tickets', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var { subject, message, email, userId, priority, attachments } = req.body;
@@ -85,7 +84,7 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
     subject: subject.substring(0, 200),
     message: message.substring(0, 5000),
     email: email || 'anonymous',
-    userId: userId || 'anonymous',  // This is key for persistence
+    userId: userId || 'anonymous',
     priority: priority || 'medium',
     status: 'new',
     createdAt: new Date().toISOString(),
@@ -95,7 +94,8 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
   };
   
   supportTickets.push(ticket);
-  console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId);
+  console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId + ' priority: ' + ticket.priority);
+  
   res.json({ success: true, ticketId: ticket.id });
 });
 
@@ -103,12 +103,11 @@ app.get('/api/support/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId || 'anonymous';
   var userTickets = supportTickets.filter(function(t) { 
-    return t.userId === userId || (t.email !== 'anonymous' && t.email === userId);
+    return t.userId === userId || t.email === userId;
   });
   res.json({ tickets: userTickets });
 });
 
-// Make sure the reply endpoint works
 app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
@@ -137,36 +136,10 @@ app.delete('/api/support/tickets/:id', function(req, res) {
   res.json({ success: true });
 });
 
-app.patch('/api/support/tickets/:id/status', express.json(), function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  var ticketId = parseInt(req.params.id);
-  var { status } = req.body;
-  
-  var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-  
-  ticket.status = status;
-  ticket.updatedAt = new Date().toISOString();
-  res.json({ success: true, ticket: ticket });
-});
-
-app.delete('/api/support/tickets/:id', function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  var ticketId = parseInt(req.params.id);
-  
-  var initialLength = supportTickets.length;
-  supportTickets = supportTickets.filter(function(t) { return t.id !== ticketId; });
-  
-  if (supportTickets.length === initialLength) {
-    return res.status(404).json({ error: 'Ticket not found' });
-  }
-  
-  res.json({ success: true });
-});
-
 // ─── DEVELOPER TICKET DASHBOARD ──────────────────────────────────────────────
 app.get('/admin/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
+  
   var adminKey = req.query.key;
   
   if (adminKey !== ADMIN_KEY) {
@@ -176,13 +149,11 @@ app.get('/admin/tickets', function(req, res) {
       <head><title>Admin Access</title>
       <style>
         body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-        .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 400px; width: 90%; text-align: center; }
-        input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 15px; margin-bottom: 16px; box-sizing: border-box; outline: none; transition: border 0.2s; }
-        input:focus { border-color: #18D4A7; }
-        button { width: 100%; padding: 14px; background: linear-gradient(135deg, #18D4A7, #0fa887); border: none; border-radius: 12px; color: #07101F; font-weight: 700; font-size: 15px; cursor: pointer; transition: transform 0.2s; }
-        button:hover { transform: translateY(-2px); }
-        h1 { color: #18D4A7; margin-bottom: 12px; }
-        .sub { color: #6b6b80; font-size: 15px; margin-bottom: 30px; }
+        .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 400px; width: 90%; }
+        input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 14px; margin-bottom: 12px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #18D4A7; border: none; border-radius: 8px; color: #07101F; font-weight: 700; font-size: 14px; cursor: pointer; }
+        h1 { color: #18D4A7; margin-bottom: 8px; }
+        .sub { color: #6b6b80; font-size: 14px; margin-bottom: 24px; }
       </style>
       </head>
       <body>
@@ -203,6 +174,7 @@ app.get('/admin/tickets', function(req, res) {
     `);
   }
   
+  // Admin dashboard HTML with attachment support
   var html = `
   <!DOCTYPE html>
   <html>
@@ -211,105 +183,102 @@ app.get('/admin/tickets', function(req, res) {
     <meta charset="UTF-8">
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0a0a0f; color: #f0f0f5; padding: 30px; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0a0a0f; color: #f0f0f5; padding: 20px; }
       .container { max-width: 1200px; margin: 0 auto; }
-      .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.07); }
-      .header h1 { font-size: 28px; color: #18D4A7; font-weight: 800; letter-spacing: -0.02em; }
-      .stats { display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }
-      .stat-card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 16px; padding: 20px 24px; flex: 1; min-width: 140px; position: relative; overflow: hidden; }
-      .stat-card::before { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 3px; background: #18D4A7; opacity: 0.5; }
-      .stat-number { font-size: 32px; font-weight: 800; color: #18D4A7; margin-bottom: 4px; }
-      .stat-label { font-size: 13px; color: #8a8a9e; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
-      .filters { display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap; background: #111118; padding: 8px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.07); display: inline-flex; }
-      .filter-btn { padding: 8px 20px; border-radius: 10px; border: none; background: transparent; color: #6b6b80; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; }
-      .filter-btn:hover { color: #f0f0f5; background: rgba(255,255,255,0.05); }
-      .filter-btn.active { background: #18D4A7; color: #07101F; box-shadow: 0 4px 12px rgba(24,212,167,0.2); }
-      
-      .ticket-list { display: flex; flex-direction: column; gap: 16px; }
-      .ticket { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 16px; padding: 24px; transition: transform 0.2s, border-color 0.2s; position: relative; }
-      .ticket:hover { border-color: rgba(24,212,167,0.4); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.2); }
-      
-      .ticket-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 12px; }
-      .ticket-id { font-weight: 800; color: #18D4A7; font-size: 16px; background: rgba(24,212,167,0.1); padding: 4px 10px; border-radius: 8px; }
-      .ticket-subject { font-weight: 700; color: #f0f0f5; font-size: 18px; flex: 1; margin-left: 8px; }
-      
-      .badges { display: flex; gap: 8px; }
-      .ticket-status, .ticket-severity { padding: 6px 14px; border-radius: 100px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; display: flex; align-items: center; gap: 6px; }
-      
-      .status-new { background: rgba(38,132,255,0.15); color: #5badff; border: 1px solid rgba(38,132,255,0.3); }
-      .status-in_progress { background: rgba(255,193,7,0.15); color: #ffc107; border: 1px solid rgba(255,193,7,0.3); }
-      .status-resolved { background: rgba(24,212,167,0.15); color: #18D4A7; border: 1px solid rgba(24,212,167,0.3); }
-      .status-closed { background: rgba(107,107,128,0.15); color: #8a8a9e; border: 1px solid rgba(107,107,128,0.3); }
-      
-      .severity-high { background: rgba(255,77,106,0.15); color: #ff4d6a; border: 1px solid rgba(255,77,106,0.3); }
-      .severity-low { background: rgba(107,107,128,0.15); color: #8a8a9e; border: 1px solid rgba(107,107,128,0.3); }
-      
-      .ticket-meta { font-size: 13px; color: #6b6b80; margin-bottom: 16px; display: flex; gap: 24px; flex-wrap: wrap; background: rgba(255,255,255,0.02); padding: 10px 16px; border-radius: 10px; }
-      .ticket-message { color: #d0d0db; font-size: 15px; line-height: 1.6; margin-bottom: 20px; padding: 16px; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.03); border-radius: 12px; }
-      
-      .ticket-attachment { margin-bottom: 20px; }
-      .ticket-attachment img { max-width: 100%; max-height: 300px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); }
-      
-      .ticket-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); }
-      .ticket-actions button { padding: 8px 16px; border-radius: 8px; border: none; font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.2s; font-family: -apple-system, sans-serif; display: flex; align-items: center; gap: 6px; }
-      
-      .btn-reply { background: rgba(24,212,167,0.15); color: #18D4A7; }
-      .btn-reply:hover { background: rgba(24,212,167,0.25); transform: translateY(-1px); }
-      .btn-resolve { background: rgba(38,132,255,0.15); color: #5badff; }
-      .btn-resolve:hover { background: rgba(38,132,255,0.25); transform: translateY(-1px); }
-      .btn-close { background: rgba(107,107,128,0.15); color: #8a8a9e; }
-      .btn-close:hover { background: rgba(107,107,128,0.25); transform: translateY(-1px); }
-      .btn-delete { background: rgba(255,77,106,0.15); color: #ff4d6a; margin-left: auto; }
-      .btn-delete:hover { background: rgba(255,77,106,0.25); transform: translateY(-1px); }
-      
-      .reply-area { display: none; margin-top: 16px; padding: 16px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); }
-      .reply-area.open { display: block; animation: fadeIn 0.3s ease; }
-      @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
-      
-      .reply-area textarea { width: 100%; padding: 14px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); background: #111118; color: #f0f0f5; font-size: 14px; resize: vertical; min-height: 80px; font-family: -apple-system, sans-serif; margin-bottom: 12px; outline: none; transition: border 0.2s; }
-      .reply-area textarea:focus { border-color: #18D4A7; }
-      .reply-area .reply-actions { display: flex; gap: 10px; }
-      
-      .btn-send-reply { background: #18D4A7; color: #07101F; padding: 10px 20px !important; }
-      .btn-cancel-reply { background: transparent; color: #8a8a9e; border: 1px solid rgba(255,255,255,0.1) !important; }
-      
-      .replies { margin-bottom: 16px; padding: 16px; background: rgba(255,255,255,0.02); border-radius: 12px; border: 1px solid rgba(255,255,255,0.03); }
-      .reply { font-size: 14px; padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 6px; }
-      .reply:last-child { border-bottom: none; padding-bottom: 0; }
-      .reply-admin { background: rgba(24,212,167,0.05); border-radius: 8px; border-left: 3px solid #18D4A7; }
-      .reply-user { background: rgba(38,132,255,0.05); border-radius: 8px; border-left: 3px solid #5badff; }
-      .reply-meta { font-size: 11px; color: #6b6b80; }
-      
-      .empty-state { text-align: center; padding: 80px 20px; color: #6b6b80; font-size: 16px; background: #111118; border-radius: 16px; border: 1px dashed rgba(255,255,255,0.1); }
-      
-      .refresh-btn { padding: 10px 20px; border-radius: 10px; border: none; background: rgba(255,255,255,0.1); color: #f0f0f5; cursor: pointer; font-size: 14px; font-weight: 600; transition: all 0.2s; display: flex; align-items: center; gap: 8px; }
-      .refresh-btn:hover { background: rgba(255,255,255,0.15); transform: translateY(-1px); }
-      
-      .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
-      .dot-new { background: #5badff; box-shadow: 0 0 8px rgba(38,132,255,0.6); }
-      .dot-in_progress { background: #ffc107; box-shadow: 0 0 8px rgba(255,193,7,0.6); }
-      .dot-resolved { background: #18D4A7; box-shadow: 0 0 8px rgba(24,212,167,0.6); }
-      .dot-closed { background: #8a8a9e; }
+      .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+      .header h1 { font-size: 24px; color: #18D4A7; }
+      .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+      .stat-card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 16px 24px; flex: 1; min-width: 120px; }
+      .stat-number { font-size: 28px; font-weight: 700; color: #18D4A7; }
+      .stat-label { font-size: 12px; color: #6b6b80; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+      .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+      .filter-btn { padding: 6px 16px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.1); background: transparent; color: #6b6b80; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+      .filter-btn:hover { border-color: #18D4A7; color: #18D4A7; }
+      .filter-btn.active { background: #18D4A7; color: #07101F; border-color: #18D4A7; }
+      .ticket-list { display: flex; flex-direction: column; gap: 12px; }
+      .ticket { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 16px 20px; transition: border-color 0.2s; }
+      .ticket:hover { border-color: rgba(24,212,167,0.3); }
+      .ticket-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }
+      .ticket-id { font-weight: 700; color: #18D4A7; font-size: 14px; }
+      .ticket-subject { font-weight: 600; color: #f0f0f5; font-size: 15px; flex: 1; }
+      .ticket-status { padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+      .status-new { background: rgba(38,132,255,0.2); color: #5badff; }
+      .status-in_progress { background: rgba(255,193,7,0.2); color: #ffc107; }
+      .status-resolved { background: rgba(24,212,167,0.2); color: #18D4A7; }
+      .status-closed { background: rgba(107,107,128,0.2); color: #6b6b80; }
+      .ticket-meta { font-size: 12px; color: #6b6b80; margin-bottom: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
+      .ticket-message { color: #a0a0b0; font-size: 13px; line-height: 1.6; margin-bottom: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+      .ticket-attachments { margin-top: 6px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 6px; }
+      .ticket-attachments details { cursor: pointer; }
+      .ticket-attachments summary { font-size: 10px; color: var(--dim); font-weight: 600; }
+      .ticket-attachments .attach-item { display: flex; align-items: center; gap: 6px; padding: 4px 8px; font-size: 10px; color: #6b6b80; border-bottom: 1px solid rgba(255,255,255,0.03); }
+      .ticket-attachments .attach-item:last-child { border-bottom: none; }
+      .ticket-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .ticket-actions button { padding: 6px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: -apple-system, sans-serif; }
+      .btn-reply { background: rgba(24,212,167,0.15); color: #18D4A7; border: 1px solid rgba(24,212,167,0.2); }
+      .btn-reply:hover { background: rgba(24,212,167,0.25); }
+      .btn-resolve { background: rgba(24,212,167,0.2); color: #18D4A7; }
+      .btn-resolve:hover { background: rgba(24,212,167,0.3); }
+      .btn-close { background: rgba(107,107,128,0.2); color: #6b6b80; }
+      .btn-close:hover { background: rgba(107,107,128,0.3); }
+      .btn-delete { background: rgba(255,77,106,0.15); color: #ff7a90; }
+      .btn-delete:hover { background: rgba(255,77,106,0.25); }
+      .btn-preview { padding: 2px 8px; border-radius: 4px; border: 1px solid #18D4A7; background: transparent; color: #18D4A7; font-size: 9px; cursor: pointer; }
+      .btn-preview:hover { background: rgba(24,212,167,0.15); }
+      .reply-area { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.07); }
+      .reply-area.open { display: block; }
+      .reply-area textarea { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 13px; resize: vertical; min-height: 60px; font-family: -apple-system, sans-serif; margin-bottom: 8px; box-sizing: border-box; }
+      .reply-area .reply-actions { display: flex; gap: 8px; }
+      .reply-area .reply-actions button { padding: 6px 16px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; }
+      .btn-send-reply { background: #18D4A7; color: #07101F; }
+      .btn-cancel-reply { background: transparent; color: #6b6b80; border: 1px solid rgba(255,255,255,0.1); }
+      .replies { margin-top: 8px; padding: 8px 12px; background: rgba(255,255,255,0.02); border-radius: 8px; }
+      .reply { font-size: 12px; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+      .reply:last-child { border-bottom: none; }
+      .reply-admin { color: #18D4A7; }
+      .reply-user { color: #5badff; }
+      .reply-meta { font-size: 10px; color: #6b6b80; margin-left: 8px; }
+      .empty-state { text-align: center; padding: 60px 20px; color: #6b6b80; }
+      .refresh-btn { padding: 8px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: transparent; color: #6b6b80; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+      .refresh-btn:hover { border-color: #18D4A7; color: #18D4A7; }
+      .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+      .dot-new { background: #5badff; }
+      .dot-in_progress { background: #ffc107; }
+      .dot-resolved { background: #18D4A7; }
+      .dot-closed { background: #6b6b80; }
+      .priority-badge { padding: 2px 8px; border-radius: 4px; font-size: 9px; font-weight: 600; }
+      .priority-critical { background: rgba(255,77,106,0.2); color: #ff4d6a; }
+      .priority-high { background: rgba(255,122,144,0.2); color: #ff7a90; }
+      .priority-medium { background: rgba(255,193,7,0.2); color: #ffc107; }
+      .priority-low { background: rgba(24,212,167,0.2); color: #18D4A7; }
+      .logout-link { color: #6b6b80; text-decoration: none; font-size: 12px; }
+      .logout-link:hover { color: #f0f0f5; }
+      @media (max-width: 768px) {
+        .ticket-header { flex-direction: column; align-items: flex-start; }
+        .stats { flex-direction: column; }
+      }
     </style>
   </head>
   <body>
     <div class="container">
       <div class="header">
-        <h1>🎫 Support Desk</h1>
+        <h1>🎫 Support Tickets</h1>
         <div style="display:flex; gap:12px; align-items:center;">
-          <button class="refresh-btn" onclick="fetchTickets()">↻ Refresh Data</button>
+          <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+          <a href="/admin/tickets?key=${adminKey}" class="logout-link">↺ Reload</a>
         </div>
       </div>
       
       <div class="stats" id="stats">
-        <div class="stat-card"><div class="stat-number" id="stat-total">0</div><div class="stat-label">Total Tickets</div></div>
+        <div class="stat-card"><div class="stat-number" id="stat-total">0</div><div class="stat-label">Total</div></div>
         <div class="stat-card"><div class="stat-number" id="stat-new">0</div><div class="stat-label">New</div></div>
         <div class="stat-card"><div class="stat-number" id="stat-in-progress">0</div><div class="stat-label">In Progress</div></div>
         <div class="stat-card"><div class="stat-number" id="stat-resolved">0</div><div class="stat-label">Resolved</div></div>
+        <div class="stat-card"><div class="stat-number" id="stat-closed">0</div><div class="stat-label">Closed</div></div>
       </div>
       
       <div class="filters">
-        <button class="filter-btn active" data-filter="all" onclick="filterTickets('all',this)">All Tickets</button>
+        <button class="filter-btn active" data-filter="all" onclick="filterTickets('all',this)">All</button>
         <button class="filter-btn" data-filter="new" onclick="filterTickets('new',this)">New</button>
         <button class="filter-btn" data-filter="in_progress" onclick="filterTickets('in_progress',this)">In Progress</button>
         <button class="filter-btn" data-filter="resolved" onclick="filterTickets('resolved',this)">Resolved</button>
@@ -325,8 +294,38 @@ app.get('/admin/tickets', function(req, res) {
       var allTickets = [];
       var currentFilter = 'all';
       
+      function escapeHtml(text) {
+        if (!text) return '';
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }
+      
+      function viewAttachment(ticketId, attachIdx) {
+        var ticket = allTickets.find(function(t) { return t.id === ticketId; });
+        if (!ticket || !ticket.attachments || !ticket.attachments[attachIdx]) return;
+        var att = ticket.attachments[attachIdx];
+        if (!att.data) return;
+        var win = window.open('', '_blank');
+        win.document.write('<html><head><title>' + escapeHtml(att.name) + '</title>');
+        win.document.write('<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0a0a0f;font-family:sans-serif;}</style>');
+        win.document.write('</head><body>');
+        if (att.type && att.type.startsWith('image/')) {
+          win.document.write('<img src="data:' + att.type + ';base64,' + att.data + '" style="max-width:100%;max-height:100vh;object-fit:contain;">');
+        } else {
+          win.document.write('<div style="color:#f0f0f5;padding:20px;text-align:center">');
+          win.document.write('<div style="font-size:48px;margin-bottom:16px">📄</div>');
+          win.document.write('<div style="font-size:16px;font-weight:600">' + escapeHtml(att.name) + '</div>');
+          win.document.write('<div style="font-size:12px;color:#6b6b80;margin-top:8px">' + Math.round(att.size/1024) + ' KB</div>');
+          win.document.write('<div style="font-size:12px;color:#6b6b80;margin-top:16px">Preview not available for this file type</div>');
+          win.document.write('</div>');
+        }
+        win.document.write('</body></html>');
+        win.document.close();
+      }
+      
       function fetchTickets() {
-        fetch('/api/admin/tickets?key=${adminKey}')
+        fetch('/api/support/tickets')
           .then(r => r.json())
           .then(data => {
             allTickets = data.tickets || [];
@@ -334,7 +333,7 @@ app.get('/admin/tickets', function(req, res) {
             renderTickets();
           })
           .catch(err => {
-            document.getElementById('ticketList').innerHTML = '<div class="empty-state">❌ Failed to load tickets</div>';
+            document.getElementById('ticketList').innerHTML = '<div class="empty-state">❌ Failed to load tickets: ' + err.message + '</div>';
           });
       }
       
@@ -348,6 +347,7 @@ app.get('/admin/tickets', function(req, res) {
         document.getElementById('stat-new').textContent = stats['new'];
         document.getElementById('stat-in-progress').textContent = stats['in_progress'];
         document.getElementById('stat-resolved').textContent = stats['resolved'];
+        document.getElementById('stat-closed').textContent = stats['closed'];
       }
       
       function renderTickets() {
@@ -356,51 +356,76 @@ app.get('/admin/tickets', function(req, res) {
           return currentFilter === 'all' || t.status === currentFilter;
         });
         
-        filtered.sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt)); // Newest first
-        
         if (filtered.length === 0) {
-          list.innerHTML = '<div class="empty-state">No tickets found in this category.</div>';
+          list.innerHTML = '<div class="empty-state">No tickets found.</div>';
           return;
         }
         
         var html = '';
         filtered.forEach(function(t) {
-          var statusLabels = { 'new': 'New', 'in_progress': 'In Progress', 'resolved': 'Resolved', 'closed': 'Closed' };
-          var severityLabels = { 'high': '🚨 Incident (High)', 'low': '📝 General (Low)' };
+          var statusLabels = {
+            'new': 'New',
+            'in_progress': 'In Progress',
+            'resolved': 'Resolved',
+            'closed': 'Closed'
+          };
+          var statusClass = 'status-' + t.status;
+          var dotClass = 'dot-' + t.status;
+          
+          var priorityLabels = {
+            'critical': { label: '🔥 Critical', cls: 'priority-critical' },
+            'high': { label: '🔴 Incident', cls: 'priority-high' },
+            'medium': { label: '🟡 Medium', cls: 'priority-medium' },
+            'low': { label: '🟢 General', cls: 'priority-low' }
+          };
+          var pr = priorityLabels[t.priority || 'low'] || priorityLabels['low'];
           
           html += '<div class="ticket" id="ticket-' + t.id + '">';
-          
           html += '<div class="ticket-header">';
           html += '<span class="ticket-id">#' + t.id + '</span>';
           html += '<span class="ticket-subject">' + escapeHtml(t.subject) + '</span>';
-          html += '<div class="badges">';
-          html += '<span class="ticket-severity severity-' + (t.severity||'low') + '">' + severityLabels[t.severity||'low'] + '</span>';
-          html += '<span class="ticket-status status-' + t.status + '"><span class="status-dot dot-' + t.status + '"></span>' + statusLabels[t.status] + '</span>';
-          html += '</div></div>';
-          
-          html += '<div class="ticket-meta">';
-          html += '<span>👤 User ID: ' + escapeHtml(t.userId) + '</span>';
-          html += '<span>📧 ' + escapeHtml(t.email || 'N/A') + '</span>';
-          html += '<span>🕐 Created: ' + new Date(t.createdAt).toLocaleString() + '</span>';
-          html += '<span>🔄 Updated: ' + new Date(t.updatedAt).toLocaleString() + '</span>';
+          html += '<div style="display:flex;gap:4px;flex-wrap:wrap">';
+          html += '<span class="priority-badge ' + pr.cls + '">' + pr.label + '</span>';
+          html += '<span class="ticket-status ' + statusClass + '"><span class="status-dot ' + dotClass + '"></span>' + statusLabels[t.status] + '</span>';
           html += '</div>';
-          
+          html += '</div>';
+          html += '<div class="ticket-meta">';
+          html += '<span>📧 ' + escapeHtml(t.email || 'anonymous') + '</span>';
+          html += '<span>🕐 ' + new Date(t.createdAt).toLocaleString() + '</span>';
+          html += '<span>🔄 Updated: ' + new Date(t.updatedAt).toLocaleString() + '</span>';
+          html += '<span>👤 ' + escapeHtml(t.userId || 'unknown') + '</span>';
+          html += '</div>';
           html += '<div class="ticket-message">' + escapeHtml(t.message) + '</div>';
           
-          if (t.attachment) {
-            html += '<div class="ticket-attachment">';
-            html += '<a href="' + t.attachment + '" target="_blank"><img src="' + t.attachment + '" alt="Attachment"/></a>';
+          // Attachments
+          if (t.attachments && t.attachments.length > 0) {
+            html += '<div class="ticket-attachments">';
+            html += '<details>';
+            html += '<summary>📎 Attachments (' + t.attachments.length + ')</summary>';
+            html += '<div style="margin-top:4px;padding:4px 0">';
+            t.attachments.forEach(function(a, idx) {
+              var isImage = a.type && a.type.startsWith('image/');
+              html += '<div class="attach-item">';
+              html += '<span>' + (isImage ? '🖼️' : '📄') + '</span>';
+              html += '<span style="flex:1">' + escapeHtml(a.name) + '</span>';
+              html += '<span style="font-size:8px;color:#6b6b80">' + Math.round(a.size/1024) + 'KB</span>';
+              if (isImage && a.data) {
+                html += '<button class="btn-preview" onclick="viewAttachment(' + t.id + ',' + idx + ')">👁️ Preview</button>';
+              }
+              html += '</div>';
+            });
+            html += '</div></details>';
             html += '</div>';
           }
           
+          // Replies
           if (t.replies && t.replies.length > 0) {
             html += '<div class="replies">';
             t.replies.forEach(function(r) {
+              var label = r.isAdmin ? '👨‍💻 Support' : '👤 User';
               var cls = r.isAdmin ? 'reply-admin' : 'reply-user';
-              var author = r.isAdmin ? '👨‍💻 Support Team' : '👤 User';
               html += '<div class="reply ' + cls + '">';
-              html += '<strong>' + author + '</strong>';
-              html += '<span>' + escapeHtml(r.message) + '</span>';
+              html += '<strong>' + label + ':</strong> ' + escapeHtml(r.message);
               html += '<span class="reply-meta">' + new Date(r.createdAt).toLocaleString() + '</span>';
               html += '</div>';
             });
@@ -409,33 +434,34 @@ app.get('/admin/tickets', function(req, res) {
           
           html += '<div class="ticket-actions">';
           html += '<button class="btn-reply" onclick="toggleReply(' + t.id + ')">💬 Reply</button>';
-          if (t.status !== 'resolved') html += '<button class="btn-resolve" onclick="updateStatus(' + t.id + ',\\'resolved\\')">✓ Resolve</button>';
-          if (t.status !== 'closed') html += '<button class="btn-close" onclick="updateStatus(' + t.id + ',\\'closed\\')">✕ Close</button>';
-          html += '<button class="btn-delete" onclick="deleteTicket(' + t.id + ')">🗑 Delete</button>';
+          if (t.status !== 'resolved') {
+            html += '<button class="btn-resolve" onclick="updateStatus(' + t.id + ',\\'resolved\\')">✓ Resolve</button>';
+          }
+          if (t.status !== 'closed') {
+            html += '<button class="btn-close" onclick="updateStatus(' + t.id + ',\\'closed\\')">✕ Close</button>';
+          }
+          if (t.status === 'new' || t.status === 'in_progress') {
+            html += '<button class="btn-delete" onclick="deleteTicket(' + t.id + ')">🗑 Delete</button>';
+          }
           html += '</div>';
           
           html += '<div class="reply-area" id="reply-area-' + t.id + '">';
-          html += '<textarea id="reply-text-' + t.id + '" placeholder="Type your response to the user..."></textarea>';
+          html += '<textarea id="reply-text-' + t.id + '" placeholder="Type your reply..."></textarea>';
           html += '<div class="reply-actions">';
           html += '<button class="btn-send-reply" onclick="sendReply(' + t.id + ')">Send Reply</button>';
           html += '<button class="btn-cancel-reply" onclick="toggleReply(' + t.id + ')">Cancel</button>';
-          html += '</div></div>';
+          html += '</div>';
+          html += '</div>';
           
           html += '</div>';
         });
+        
         list.innerHTML = html;
-      }
-      
-      function escapeHtml(text) {
-        if (!text) return '';
-        var div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
       }
       
       function filterTickets(filter, btn) {
         currentFilter = filter;
-        document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
         if (btn) btn.classList.add('active');
         renderTickets();
       }
@@ -444,7 +470,9 @@ app.get('/admin/tickets', function(req, res) {
         var area = document.getElementById('reply-area-' + id);
         if (area) {
           area.classList.toggle('open');
-          if (area.classList.contains('open')) document.getElementById('reply-text-' + id).focus();
+          if (area.classList.contains('open')) {
+            document.getElementById('reply-text-' + id).focus();
+          }
         }
       }
       
@@ -459,43 +487,74 @@ app.get('/admin/tickets', function(req, res) {
         })
         .then(r => r.json())
         .then(data => {
-          if (data.success) fetchTickets();
-        });
+          if (data.success) {
+            document.getElementById('reply-text-' + id).value = '';
+            document.getElementById('reply-area-' + id).classList.remove('open');
+            fetchTickets();
+          } else {
+            alert('Failed to send reply: ' + (data.error || 'unknown error'));
+          }
+        })
+        .catch(err => alert('Error: ' + err.message));
       }
       
       function updateStatus(id, status) {
-        if (!confirm('Change ticket status to "' + status + '"?')) return;
-        fetch('/api/support/tickets/' + id + '/status', {
-          method: 'PATCH',
+        if (!confirm('Change ticket #' + id + ' status to "' + status + '"?')) return;
+        
+        fetch('/api/support/tickets/' + id + '/reply', {
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: status })
+          body: JSON.stringify({ 
+            message: 'Status updated to: ' + status,
+            isAdmin: true 
+          })
         })
         .then(r => r.json())
         .then(data => {
-          if (data.success) fetchTickets();
-        });
+          if (data.success) {
+            var ticket = allTickets.find(function(t) { return t.id === id; });
+            if (ticket) ticket.status = status;
+            renderTickets();
+            updateStats();
+          } else {
+            alert('Failed to update status.');
+          }
+        })
+        .catch(err => alert('Error: ' + err.message));
       }
       
       function deleteTicket(id) {
-        if (!confirm('Permanently delete ticket #' + id + '? This cannot be undone.')) return;
-        fetch('/api/support/tickets/' + id, { method: 'DELETE' })
+        if (!confirm('Delete ticket #' + id + '? This cannot be undone.')) return;
+        
+        fetch('/api/support/tickets/' + id, {
+          method: 'DELETE'
+        })
         .then(r => r.json())
         .then(data => {
-          if (data.success) fetchTickets();
-        });
+          if (data.success) {
+            allTickets = allTickets.filter(function(t) { return t.id !== id; });
+            renderTickets();
+            updateStats();
+          } else {
+            alert('Failed to delete ticket.');
+          }
+        })
+        .catch(err => alert('Error: ' + err.message));
       }
       
+      // Auto-refresh every 30 seconds
       setInterval(fetchTickets, 30000);
+      
+      // Initial load
       fetchTickets();
     </script>
   </body>
   </html>
   `;
+  
   res.send(html);
 });
 
-// ... (Rest of your endpoints like test-connection, analyze, chat, etc. remain unchanged. Make sure to keep them!)
-// To save space, keep everything below // ─── WHAT'S NEW ─── exactly as it was in your original code.
 // Admin API endpoint to get all tickets (for the dashboard)
 app.get('/api/admin/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -653,21 +712,18 @@ app.get('/auth/token', rateLimiter(20), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var code = req.query.code;
   
-  // Check if code exists
   if (!code) {
     return res.status(400).json({ 
       error: 'No code provided. Please enter the 6-digit code from your browser.' 
     });
   }
   
-  // Check if code is valid
   if (!pendingCodes[code]) {
     return res.status(404).json({ 
       error: '❌ Invalid code. Please make sure you entered the correct 6-digit code from your browser window.' 
     });
   }
   
-  // Check if code has expired
   if (Date.now() > pendingCodes[code].expiresAt) { 
     delete pendingCodes[code]; 
     return res.status(410).json({ 
