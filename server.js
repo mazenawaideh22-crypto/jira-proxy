@@ -72,9 +72,10 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
+// In the support tickets section, ensure userId is properly stored
 app.post('/api/support/tickets', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var { subject, message, email, userId, severity, attachment } = req.body;
+  var { subject, message, email, userId, priority, attachments } = req.body;
   if (!subject || !message) {
     return res.status(400).json({ error: 'Subject and message are required' });
   }
@@ -84,18 +85,17 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
     subject: subject.substring(0, 200),
     message: message.substring(0, 5000),
     email: email || 'anonymous',
-    userId: userId || 'anonymous',
-    severity: severity || 'low', // 'high' for incident, 'low' for general request
-    attachment: attachment || null, // store base64 or file URL
-    status: 'new', // new, in_progress, resolved, closed
+    userId: userId || 'anonymous',  // This is key for persistence
+    priority: priority || 'medium',
+    status: 'new',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    replies: []
+    replies: [],
+    attachments: attachments || []
   };
   
   supportTickets.push(ticket);
-  console.log('[SUPPORT] New ticket #' + ticket.id + ': ' + subject + ' (' + ticket.severity + ')');
-  
+  console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId);
   res.json({ success: true, ticketId: ticket.id });
 });
 
@@ -108,6 +108,7 @@ app.get('/api/support/tickets', function(req, res) {
   res.json({ tickets: userTickets });
 });
 
+// Make sure the reply endpoint works
 app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
@@ -122,9 +123,18 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
     createdAt: new Date().toISOString()
   });
   ticket.updatedAt = new Date().toISOString();
-  if (isAdmin && ticket.status === 'new') ticket.status = 'in_progress';
+  if (isAdmin) ticket.status = 'in_progress';
   
-  res.json({ success: true, ticket: ticket });
+  res.json({ success: true });
+});
+
+app.delete('/api/support/tickets/:id', function(req, res) {
+  res.header('Access-Control-Allow-Origin', '*');
+  var ticketId = parseInt(req.params.id);
+  var index = supportTickets.findIndex(function(t) { return t.id === ticketId; });
+  if (index === -1) return res.status(404).json({ error: 'Ticket not found' });
+  supportTickets.splice(index, 1);
+  res.json({ success: true });
 });
 
 app.patch('/api/support/tickets/:id/status', express.json(), function(req, res) {
