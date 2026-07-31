@@ -94,7 +94,7 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
   };
   
   supportTickets.push(ticket);
-  console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId + ' priority: ' + ticket.priority);
+  console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId + ' priority: ' + ticket.priority + ' attachments: ' + (attachments ? attachments.length : 0));
   
   res.json({ success: true, ticketId: ticket.id });
 });
@@ -174,7 +174,6 @@ app.get('/admin/tickets', function(req, res) {
     `);
   }
   
-  // Admin dashboard HTML with attachment support
   var html = `
   <!DOCTYPE html>
   <html>
@@ -210,9 +209,11 @@ app.get('/admin/tickets', function(req, res) {
       .ticket-message { color: #a0a0b0; font-size: 13px; line-height: 1.6; margin-bottom: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 8px; }
       .ticket-attachments { margin-top: 6px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 6px; }
       .ticket-attachments details { cursor: pointer; }
-      .ticket-attachments summary { font-size: 10px; color: var(--dim); font-weight: 600; }
+      .ticket-attachments summary { font-size: 10px; color: #6b6b80; font-weight: 600; }
+      .ticket-attachments summary:hover { color: #18D4A7; }
       .ticket-attachments .attach-item { display: flex; align-items: center; gap: 6px; padding: 4px 8px; font-size: 10px; color: #6b6b80; border-bottom: 1px solid rgba(255,255,255,0.03); }
       .ticket-attachments .attach-item:last-child { border-bottom: none; }
+      .ticket-attachments .attach-item:hover { background: rgba(255,255,255,0.02); }
       .ticket-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
       .ticket-actions button { padding: 6px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: -apple-system, sans-serif; }
       .btn-reply { background: rgba(24,212,167,0.15); color: #18D4A7; border: 1px solid rgba(24,212,167,0.2); }
@@ -223,15 +224,18 @@ app.get('/admin/tickets', function(req, res) {
       .btn-close:hover { background: rgba(107,107,128,0.3); }
       .btn-delete { background: rgba(255,77,106,0.15); color: #ff7a90; }
       .btn-delete:hover { background: rgba(255,77,106,0.25); }
-      .btn-preview { padding: 2px 8px; border-radius: 4px; border: 1px solid #18D4A7; background: transparent; color: #18D4A7; font-size: 9px; cursor: pointer; }
+      .btn-preview { padding: 2px 10px; border-radius: 4px; border: 1px solid #18D4A7; background: transparent; color: #18D4A7; font-size: 9px; cursor: pointer; font-family: -apple-system, sans-serif; }
       .btn-preview:hover { background: rgba(24,212,167,0.15); }
       .reply-area { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.07); }
       .reply-area.open { display: block; }
       .reply-area textarea { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: #1a1a24; color: #f0f0f5; font-size: 13px; resize: vertical; min-height: 60px; font-family: -apple-system, sans-serif; margin-bottom: 8px; box-sizing: border-box; }
+      .reply-area textarea:focus { outline: none; border-color: #18D4A7; }
       .reply-area .reply-actions { display: flex; gap: 8px; }
       .reply-area .reply-actions button { padding: 6px 16px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; }
       .btn-send-reply { background: #18D4A7; color: #07101F; }
+      .btn-send-reply:hover { opacity: 0.85; }
       .btn-cancel-reply { background: transparent; color: #6b6b80; border: 1px solid rgba(255,255,255,0.1); }
+      .btn-cancel-reply:hover { background: rgba(255,255,255,0.05); }
       .replies { margin-top: 8px; padding: 8px 12px; background: rgba(255,255,255,0.02); border-radius: 8px; }
       .reply { font-size: 12px; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
       .reply:last-child { border-bottom: none; }
@@ -303,23 +307,66 @@ app.get('/admin/tickets', function(req, res) {
       
       function viewAttachment(ticketId, attachIdx) {
         var ticket = allTickets.find(function(t) { return t.id === ticketId; });
-        if (!ticket || !ticket.attachments || !ticket.attachments[attachIdx]) return;
+        if (!ticket || !ticket.attachments || !ticket.attachments[attachIdx]) {
+          alert('Attachment not found.');
+          return;
+        }
         var att = ticket.attachments[attachIdx];
-        if (!att.data) return;
+        if (!att.data) {
+          alert('No data available for this attachment.');
+          return;
+        }
+        
         var win = window.open('', '_blank');
+        if (!win) {
+          alert('Please allow popups to view attachments.');
+          return;
+        }
+        
+        var isImage = att.type && att.type.startsWith('image/');
+        var isPDF = att.type && att.type === 'application/pdf';
+        
         win.document.write('<html><head><title>' + escapeHtml(att.name) + '</title>');
-        win.document.write('<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0a0a0f;font-family:sans-serif;}</style>');
+        win.document.write('<style>');
+        win.document.write('body { margin:0; display:flex; align-items:center; justify-content:center; min-height:100vh; background:#0a0a0f; font-family:-apple-system,sans-serif; }');
+        win.document.write('img { max-width:100%; max-height:100vh; object-fit:contain; }');
+        win.document.write('.file-info { color:#f0f0f5; padding:20px; text-align:center; max-width:600px; }');
+        win.document.write('.file-info .icon { font-size:64px; margin-bottom:16px; }');
+        win.document.write('.file-info .name { font-size:18px; font-weight:600; margin-bottom:8px; word-break:break-all; }');
+        win.document.write('.file-info .size { font-size:14px; color:#6b6b80; }');
+        win.document.write('.file-info .type { font-size:12px; color:#6b6b80; margin-top:8px; }');
+        win.document.write('.file-info .actions { margin-top:16px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }');
+        win.document.write('.file-info .actions a, .file-info .actions button { display:inline-block; padding:10px 24px; background:#18D4A7; color:#07101F; border:none; border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; text-decoration:none; }');
+        win.document.write('.file-info .actions a:hover, .file-info .actions button:hover { opacity:0.85; }');
+        win.document.write('.file-info .actions .secondary { background:transparent; color:#18D4A7; border:1px solid #18D4A7; }');
+        win.document.write('</style>');
         win.document.write('</head><body>');
-        if (att.type && att.type.startsWith('image/')) {
-          win.document.write('<img src="data:' + att.type + ';base64,' + att.data + '" style="max-width:100%;max-height:100vh;object-fit:contain;">');
+        
+        if (isImage) {
+          win.document.write('<img src="data:' + att.type + ';base64,' + att.data + '" alt="' + escapeHtml(att.name) + '" />');
+        } else if (isPDF) {
+          win.document.write('<div class="file-info">');
+          win.document.write('<div class="icon">📄</div>');
+          win.document.write('<div class="name">' + escapeHtml(att.name) + '</div>');
+          win.document.write('<div class="size">' + Math.round(att.size/1024) + ' KB</div>');
+          win.document.write('<div class="type">PDF Document</div>');
+          win.document.write('<div class="actions">');
+          win.document.write('<a href="data:application/pdf;base64,' + att.data + '" download="' + escapeHtml(att.name) + '">⬇ Download PDF</a>');
+          win.document.write('</div>');
+          win.document.write('</div>');
         } else {
-          win.document.write('<div style="color:#f0f0f5;padding:20px;text-align:center">');
-          win.document.write('<div style="font-size:48px;margin-bottom:16px">📄</div>');
-          win.document.write('<div style="font-size:16px;font-weight:600">' + escapeHtml(att.name) + '</div>');
-          win.document.write('<div style="font-size:12px;color:#6b6b80;margin-top:8px">' + Math.round(att.size/1024) + ' KB</div>');
-          win.document.write('<div style="font-size:12px;color:#6b6b80;margin-top:16px">Preview not available for this file type</div>');
+          var fileTypeLabel = att.type || 'Unknown type';
+          win.document.write('<div class="file-info">');
+          win.document.write('<div class="icon">📄</div>');
+          win.document.write('<div class="name">' + escapeHtml(att.name) + '</div>');
+          win.document.write('<div class="size">' + Math.round(att.size/1024) + ' KB</div>');
+          win.document.write('<div class="type">' + escapeHtml(fileTypeLabel) + '</div>');
+          win.document.write('<div class="actions">');
+          win.document.write('<a href="data:' + att.type + ';base64,' + att.data + '" download="' + escapeHtml(att.name) + '">⬇ Download File</a>');
+          win.document.write('</div>');
           win.document.write('</div>');
         }
+        
         win.document.write('</body></html>');
         win.document.close();
       }
@@ -405,12 +452,16 @@ app.get('/admin/tickets', function(req, res) {
             html += '<div style="margin-top:4px;padding:4px 0">';
             t.attachments.forEach(function(a, idx) {
               var isImage = a.type && a.type.startsWith('image/');
+              var isPDF = a.type && a.type === 'application/pdf';
+              var icon = isImage ? '🖼️' : (isPDF ? '📑' : '📄');
               html += '<div class="attach-item">';
-              html += '<span>' + (isImage ? '🖼️' : '📄') + '</span>';
+              html += '<span>' + icon + '</span>';
               html += '<span style="flex:1">' + escapeHtml(a.name) + '</span>';
               html += '<span style="font-size:8px;color:#6b6b80">' + Math.round(a.size/1024) + 'KB</span>';
-              if (isImage && a.data) {
-                html += '<button class="btn-preview" onclick="viewAttachment(' + t.id + ',' + idx + ')">👁️ Preview</button>';
+              if (a.data) {
+                html += '<button class="btn-preview" onclick="viewAttachment(' + t.id + ',' + idx + ')">';
+                html += isImage ? '👁️ Preview' : '⬇ Download';
+                html += '</button>';
               }
               html += '</div>';
             });
@@ -582,7 +633,8 @@ app.get('/api/whats-new', function(req, res) {
           'Fixed Apple Watch display issues',
           'Improved history view & reuse functionality',
           'Added What\'s New, Help & Support, and Privacy Policy pages',
-          'Admin dashboard for managing support tickets'
+          'Admin dashboard for managing support tickets',
+          'Attachment preview and download in admin dashboard'
         ]
       },
       {
