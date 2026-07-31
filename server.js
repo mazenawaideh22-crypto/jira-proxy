@@ -4,7 +4,6 @@ const cors    = require('cors');
 const https   = require('https');
 const crypto  = require('crypto');
 const path    = require('path');
-const fs      = require('fs');
 const helmet  = require('helmet');
 
 const app = express();
@@ -63,44 +62,8 @@ const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
 var pendingStates = {};
-
-// ─── SUPPORT TICKETS (persisted to disk so they survive restarts/deploys) ────
-var TICKETS_FILE = path.join(__dirname, 'data', 'tickets.json');
 var supportTickets = [];
 var ticketIdCounter = 1;
-
-function loadTicketsFromDisk() {
-  try {
-    if (fs.existsSync(TICKETS_FILE)) {
-      var raw = fs.readFileSync(TICKETS_FILE, 'utf8');
-      var parsed = JSON.parse(raw);
-      supportTickets = parsed.tickets || [];
-      ticketIdCounter = parsed.ticketIdCounter || (supportTickets.reduce(function(m, t) { return Math.max(m, t.id); }, 0) + 1);
-      console.log('[SUPPORT] Loaded ' + supportTickets.length + ' tickets from disk');
-    }
-  } catch (e) {
-    console.error('[SUPPORT] Failed to load tickets from disk:', e.message);
-  }
-}
-
-var _saveScheduled = false;
-function saveTicketsToDisk() {
-  // Debounce writes slightly so bursts of updates don't hammer the disk
-  if (_saveScheduled) return;
-  _saveScheduled = true;
-  setImmediate(function() {
-    _saveScheduled = false;
-    try {
-      var dir = path.dirname(TICKETS_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(TICKETS_FILE, JSON.stringify({ tickets: supportTickets, ticketIdCounter: ticketIdCounter }, null, 2));
-    } catch (e) {
-      console.error('[SUPPORT] Failed to save tickets to disk:', e.message);
-    }
-  });
-}
-
-loadTicketsFromDisk();
 
 setInterval(function() {
   var now = Date.now();
@@ -108,45 +71,14 @@ setInterval(function() {
   Object.keys(pendingStates).forEach(function(s) { if (now - pendingStates[s].createdAt > 10 * 60 * 1000) delete pendingStates[s]; });
 }, 60000);
 
-var VALID_STATUSES = ['new', 'in_progress', 'resolved', 'closed'];
-var VALID_PRIORITIES = ['high', 'low'];
-
-function findTicket(id) {
-  return supportTickets.find(function(t) { return t.id === id; });
-}
-
-// Normalize identity: a ticket "belongs" to a user if either their stable
-// userId or their email matches — but userId (persisted client-side, stable
-// across logout/login) is the primary key so a ticket always follows the
-// same account even if they used a different/no email.
-function ticketBelongsTo(ticket, userId, email) {
-  if (userId && ticket.userId && ticket.userId !== 'anonymous' && ticket.userId === userId) return true;
-  if (email && ticket.email && ticket.email !== 'anonymous' && ticket.email.toLowerCase() === String(email).toLowerCase()) return true;
-  if ((!userId || userId === 'anonymous') && (!email) && ticket.userId === 'anonymous') return true;
-  return false;
-}
-
-// ─── USER-FACING: create / list / reply ──────────────────────────────────────
-app.post('/api/support/tickets', express.json({ limit: '8mb' }), function(req, res) {
+// ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
+app.post('/api/support/tickets', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var { subject, message, email, userId, attachments } = req.body;
+  var { subject, message, email, userId } = req.body;
   if (!subject || !message) {
     return res.status(400).json({ error: 'Subject and message are required' });
   }
-
-  var safeAttachments = [];
-  if (Array.isArray(attachments)) {
-    attachments.slice(0, 5).forEach(function(a) {
-      if (a && a.dataUrl && typeof a.dataUrl === 'string' && a.dataUrl.length < 4 * 1024 * 1024) {
-        safeAttachments.push({
-          name: String(a.name || 'attachment').substring(0, 150),
-          type: String(a.type || '').substring(0, 100),
-          dataUrl: a.dataUrl
-        });
-      }
-    });
-  }
-
+  
   var ticket = {
     id: ticketIdCounter++,
     subject: subject.substring(0, 200),
@@ -154,142 +86,42 @@ app.post('/api/support/tickets', express.json({ limit: '8mb' }), function(req, r
     email: email || 'anonymous',
     userId: userId || 'anonymous',
     status: 'new', // new, in_progress, resolved, closed
-    priority: 'low', // low (general request) or high (incident) — set by admin
-    attachments: safeAttachments,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     replies: []
   };
-
+  
   supportTickets.push(ticket);
-  saveTicketsToDisk();
   console.log('[SUPPORT] New ticket #' + ticket.id + ': ' + subject);
-
+  
   res.json({ success: true, ticketId: ticket.id });
 });
 
 app.get('/api/support/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId || 'anonymous';
-  var email = req.query.email || '';
-  var userTickets = supportTickets.filter(function(t) {
-    return ticketBelongsTo(t, userId, email);
+  var userTickets = supportTickets.filter(function(t) { 
+    return t.userId === userId || t.email === userId;
   });
   res.json({ tickets: userTickets });
 });
 
-// USER reply — always recorded as a user message; isAdmin can never be forced
-// true from here (that requires the admin key), so it can't be spoofed.
 app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
-  var { message } = req.body;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message is required' });
-
-  var ticket = findTicket(ticketId);
+  var { message, isAdmin } = req.body;
+  
+  var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-
+  
   ticket.replies.push({
-    message: message.substring(0, 5000),
-    isAdmin: false,
+    message: message,
+    isAdmin: isAdmin || false,
     createdAt: new Date().toISOString()
   });
   ticket.updatedAt = new Date().toISOString();
-  // If the user follows up on a resolved/closed ticket, reopen it automatically
-  if (ticket.status === 'resolved' || ticket.status === 'closed') {
-    ticket.status = 'in_progress';
-  } else if (ticket.status === 'new') {
-    ticket.status = 'in_progress';
-  }
-  saveTicketsToDisk();
-
-  res.json({ success: true, ticket: ticket });
-});
-
-// ─── ADMIN-ONLY: reply / status / priority / delete ──────────────────────────
-function requireAdminKey(req, res) {
-  var key = req.body.key || req.query.key;
-  if (key !== ADMIN_KEY) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return false;
-  }
-  return true;
-}
-
-app.post('/api/admin/tickets/:id/reply', express.json(), function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  if (!requireAdminKey(req, res)) return;
-  var ticketId = parseInt(req.params.id);
-  var message = req.body.message;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message is required' });
-
-  var ticket = findTicket(ticketId);
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-
-  ticket.replies.push({
-    message: message.substring(0, 5000),
-    isAdmin: true,
-    createdAt: new Date().toISOString()
-  });
-  ticket.updatedAt = new Date().toISOString();
-  if (ticket.status === 'new') ticket.status = 'in_progress';
-  saveTicketsToDisk();
-
-  res.json({ success: true, ticket: ticket });
-});
-
-app.post('/api/admin/tickets/:id/status', express.json(), function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  if (!requireAdminKey(req, res)) return;
-  var ticketId = parseInt(req.params.id);
-  var status = req.body.status;
-  if (VALID_STATUSES.indexOf(status) === -1) return res.status(400).json({ error: 'Invalid status' });
-
-  var ticket = findTicket(ticketId);
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-
-  ticket.status = status;
-  ticket.updatedAt = new Date().toISOString();
-  saveTicketsToDisk();
-
-  res.json({ success: true, ticket: ticket });
-});
-
-app.post('/api/admin/tickets/:id/priority', express.json(), function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  if (!requireAdminKey(req, res)) return;
-  var ticketId = parseInt(req.params.id);
-  var priority = req.body.priority;
-  if (VALID_PRIORITIES.indexOf(priority) === -1) return res.status(400).json({ error: 'Invalid priority' });
-
-  var ticket = findTicket(ticketId);
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-
-  ticket.priority = priority;
-  ticket.updatedAt = new Date().toISOString();
-  saveTicketsToDisk();
-
-  res.json({ success: true, ticket: ticket });
-});
-
-app.post('/api/admin/tickets/:id/delete', express.json(), function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  if (!requireAdminKey(req, res)) return;
-  var ticketId = parseInt(req.params.id);
-  var before = supportTickets.length;
-  supportTickets = supportTickets.filter(function(t) { return t.id !== ticketId; });
-  if (supportTickets.length === before) return res.status(404).json({ error: 'Ticket not found' });
-  saveTicketsToDisk();
-  res.json({ success: true });
-});
-app.delete('/api/admin/tickets/:id', function(req, res) {
-  res.header('Access-Control-Allow-Origin', '*');
-  if (!requireAdminKey(req, res)) return;
-  var ticketId = parseInt(req.params.id);
-  var before = supportTickets.length;
-  supportTickets = supportTickets.filter(function(t) { return t.id !== ticketId; });
-  if (supportTickets.length === before) return res.status(404).json({ error: 'Ticket not found' });
-  saveTicketsToDisk();
+  if (isAdmin) ticket.status = 'in_progress';
+  
   res.json({ success: true });
 });
 
