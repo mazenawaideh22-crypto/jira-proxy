@@ -62,8 +62,54 @@ const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
 var pendingStates = {};
-var supportTickets = [];
-var ticketIdCounter = 1;
+
+// ─── PERSISTED STORE: SUPPORT TICKETS ────────────────────────────────────────
+// These used to live only in a RAM array, so every redeploy (new Node process)
+// wiped all tickets. We now load them from disk on boot and save after every
+// write, so a deploy no longer destroys user data.
+//
+// IMPORTANT: this only survives redeploys if DATA_DIR points at a persistent
+// disk/volume. On platforms with an ephemeral filesystem (e.g. Railway without
+// a Volume attached), the file itself gets wiped on deploy just like RAM did.
+// In Railway: Project → Service → Settings → Volumes → add a volume mounted at
+// the path you set DATA_DIR to (e.g. /data), then set env var DATA_DIR=/data.
+// For a more robust/scalable long-term fix, migrate this to a real database
+// (Railway Postgres, etc.) instead of a JSON file.
+const fs = require('fs');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const TICKETS_FILE = path.join(DATA_DIR, 'tickets.json');
+
+function loadTickets() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (fs.existsSync(TICKETS_FILE)) {
+      var raw = fs.readFileSync(TICKETS_FILE, 'utf8');
+      var parsed = JSON.parse(raw);
+      return {
+        tickets: Array.isArray(parsed.tickets) ? parsed.tickets : [],
+        nextId: parsed.nextId || 1
+      };
+    }
+  } catch (e) {
+    console.error('[TICKETS] Failed to load tickets.json, starting empty:', e.message);
+  }
+  return { tickets: [], nextId: 1 };
+}
+
+var _loaded = loadTickets();
+var supportTickets = _loaded.tickets;
+var ticketIdCounter = _loaded.nextId;
+
+function saveTickets() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(TICKETS_FILE, JSON.stringify({ tickets: supportTickets, nextId: ticketIdCounter }, null, 2));
+  } catch (e) {
+    console.error('[TICKETS] Failed to save tickets.json:', e.message);
+  }
+}
+
+console.log('[TICKETS] Loaded ' + supportTickets.length + ' ticket(s) from ' + TICKETS_FILE);
 
 setInterval(function() {
   var now = Date.now();
@@ -94,6 +140,7 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
   };
   
   supportTickets.push(ticket);
+  saveTickets();
   console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId + ' priority: ' + ticket.priority + ' attachments: ' + (attachments ? attachments.length : 0));
   
   res.json({ success: true, ticketId: ticket.id });
@@ -123,6 +170,7 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   });
   ticket.updatedAt = new Date().toISOString();
   if (isAdmin) ticket.status = 'in_progress';
+  saveTickets();
   
   res.json({ success: true });
 });
@@ -133,6 +181,7 @@ app.delete('/api/support/tickets/:id', function(req, res) {
   var index = supportTickets.findIndex(function(t) { return t.id === ticketId; });
   if (index === -1) return res.status(404).json({ error: 'Ticket not found' });
   supportTickets.splice(index, 1);
+  saveTickets();
   res.json({ success: true });
 });
 
