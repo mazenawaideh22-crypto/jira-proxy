@@ -158,7 +158,8 @@ app.get('/api/support/tickets', function(req, res) {
 app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
-  var { message, isAdmin } = req.body;
+  var { message, isAdmin, status } = req.body;
+  var VALID_STATUSES = ['new', 'in_progress', 'resolved', 'closed'];
   
   var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
@@ -169,7 +170,17 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
     createdAt: new Date().toISOString()
   });
   ticket.updatedAt = new Date().toISOString();
-  if (isAdmin) ticket.status = 'in_progress';
+  if (isAdmin) {
+    if (status && VALID_STATUSES.indexOf(status) !== -1) {
+      // Explicit status change from Resolve/Close buttons — always respect it.
+      ticket.status = status;
+    } else if (ticket.status === 'new') {
+      // Plain reply with no explicit status: just bump a fresh ticket to
+      // in_progress. Don't clobber an already resolved/closed ticket just
+      // because the admin sent a follow-up note.
+      ticket.status = 'in_progress';
+    }
+  }
   saveTickets();
   
   res.json({ success: true });
@@ -537,9 +548,7 @@ app.get('/admin/tickets', function(req, res) {
           if (t.status !== 'closed') {
             html += '<button class="btn-close" onclick="updateStatus(' + t.id + ',\\'closed\\')">✕ Close</button>';
           }
-          if (t.status === 'new' || t.status === 'in_progress') {
-            html += '<button class="btn-delete" onclick="deleteTicket(' + t.id + ')">🗑 Delete</button>';
-          }
+          html += '<button class="btn-delete" onclick="deleteTicket(' + t.id + ')">🗑 Delete</button>';
           html += '</div>';
           
           html += '<div class="reply-area" id="reply-area-' + t.id + '">';
@@ -603,7 +612,8 @@ app.get('/admin/tickets', function(req, res) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ 
             message: 'Status updated to: ' + status,
-            isAdmin: true 
+            isAdmin: true,
+            status: status
           })
         })
         .then(r => r.json())
