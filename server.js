@@ -267,10 +267,7 @@ app.get('/admin/tickets', function(req, res) {
     <div class="container">
       <div class="header">
         <h1>🎫 Support Tickets</h1>
-        <div style="display:flex; gap:12px; align-items:center;">
-          <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
-          <a href="/admin/tickets?key=${adminKey}" class="logout-link">↺ Reload</a>
-        </div>
+       
       </div>
       
       <div class="stats" id="stats">
