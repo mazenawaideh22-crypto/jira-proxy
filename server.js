@@ -48,6 +48,13 @@ app.options('*', function(req, res) {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
 
+// Lightweight healthcheck target — if Railway's Healthcheck Path is set to
+// something that doesn't exist (or to '/', which does a full file read of
+// ui.html), a failing/slow check can cause Railway to kill and restart the
+// container in a loop even though the app is otherwise fine. Point Railway's
+// Healthcheck Path (Settings → Deploy → Healthcheck Path) at '/health'.
+app.get('/health', (req, res) => res.status(200).send('ok'));
+
 process.on('uncaughtException', function(err) { console.error('[CRASH] uncaughtException:', err.message, err.stack); });
 process.on('unhandledRejection', function(reason) { console.error('[CRASH] unhandledRejection:', reason); });
 
@@ -1362,6 +1369,14 @@ app.post('/comment', async function(req, res) {
 });
 
 // ─── START ───────────────────────────────────────────────────────────────────
+// Log SIGTERM explicitly so the next restart-loop shows *when* Railway is
+// asking the process to stop, which helps distinguish "platform killed us"
+// (healthcheck/OOM) from an actual in-app crash.
+process.on('SIGTERM', function() {
+  console.log('[SHUTDOWN] Received SIGTERM, exiting.');
+  process.exit(0);
+});
+
 var PORT = process.env.PORT || 8080;
 app.listen(PORT, function() {
   console.log('Structify (free/BYOK) server running on port ' + PORT);
