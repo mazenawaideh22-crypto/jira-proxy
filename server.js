@@ -55,6 +55,98 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
 // Healthcheck Path (Settings → Deploy → Healthcheck Path) at '/health'.
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
+// ─── PRIVACY POLICY & TERMS (public, required for Atlassian/Figma listings) ──
+app.get('/privacy', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Structify — Privacy Policy</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 60px auto; padding: 0 24px; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  .updated { color: #666; font-size: 14px; margin-bottom: 32px; }
+  h2 { font-size: 18px; margin-top: 36px; }
+  ul { padding-left: 20px; }
+  li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+  <h1>Structify — Privacy Policy</h1>
+  <div class="updated">Last updated: ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</div>
+
+  <p>Structify is a Figma plugin that converts Jira and GitLab tickets into design structures. This page explains what data Structify accesses, how it's used, and how long it's kept.</p>
+
+  <h2>Jira and GitLab Access</h2>
+  <p>When you connect a Jira or GitLab account, Structify requests an OAuth access token from Atlassian or GitLab on your behalf. This token is:</p>
+  <ul>
+    <li>Used only to read ticket/issue data you select, and to post comments back to tickets you choose to share results with.</li>
+    <li>Held in a short-lived, in-memory cache on our server for a maximum of 5 minutes during the login handoff, then permanently deleted.</li>
+    <li>Stored after that only inside your own Figma plugin storage, on your machine — not on our servers.</li>
+  </ul>
+  <p>We do not persist your Jira or GitLab account ID, profile data, or tokens in any database or file on our servers.</p>
+
+  <h2>AI Provider Keys</h2>
+  <p>Structify uses a "bring your own key" model for AI generation. Your API key is stored only in your local Figma plugin storage and is sent directly to the relevant AI provider through our proxy solely to fulfill your generation request. We do not store or log your API key.</p>
+
+  <h2>Ticket Content Sent for Generation</h2>
+  <p>Ticket titles, descriptions, and any additional context you provide are sent to your chosen AI provider to generate a design structure. This content is not stored by Structify after the request completes.</p>
+
+  <h2>Support Requests</h2>
+  <p>If you contact us through the in-plugin support form, we store the email address and message you provide so we can respond to you. This information is kept only as long as needed to resolve your request.</p>
+
+  <h2>What We Don't Do</h2>
+  <ul>
+    <li>We don't sell or share your data with third parties for advertising.</li>
+    <li>We don't track you across other apps or websites.</li>
+    <li>We don't store your Jira/GitLab credentials, tokens, or account data beyond the brief login handoff described above.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>Questions about this policy or your data? Reach us at <a href="mailto:YOUR_EMAIL_HERE">YOUR_EMAIL_HERE</a>.</p>
+</body>
+</html>`);
+});
+
+app.get('/terms', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Structify — Terms of Service</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 60px auto; padding: 0 24px; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  .updated { color: #666; font-size: 14px; margin-bottom: 32px; }
+  h2 { font-size: 18px; margin-top: 36px; }
+</style>
+</head>
+<body>
+  <h1>Structify — Terms of Service</h1>
+  <div class="updated">Last updated: ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</div>
+
+  <p>By using Structify, you agree to the following:</p>
+
+  <h2>Use of the Plugin</h2>
+  <p>Structify is provided free of charge, as-is, without warranty of any kind. You're responsible for reviewing any generated design output before using it in production work.</p>
+
+  <h2>Your Accounts and API Keys</h2>
+  <p>You are responsible for the Jira, GitLab, and AI provider accounts and API keys you connect to Structify, including any usage costs charged by those third parties.</p>
+
+  <h2>Acceptable Use</h2>
+  <p>You agree not to use Structify to violate the terms of service of Jira, GitLab, or any connected AI provider, or for any unlawful purpose.</p>
+
+  <h2>Changes</h2>
+  <p>We may update these terms or the plugin's functionality at any time. Continued use after changes means you accept the updated terms.</p>
+
+  <h2>Contact</h2>
+  <p>Questions? Reach us at <a href="mailto:YOUR_EMAIL_HERE">YOUR_EMAIL_HERE</a>.</p>
+</body>
+</html>`);
+});
+
 process.on('uncaughtException', function(err) { console.error('[CRASH] uncaughtException:', err.message, err.stack); });
 process.on('unhandledRejection', function(reason) { console.error('[CRASH] unhandledRejection:', reason); });
 
