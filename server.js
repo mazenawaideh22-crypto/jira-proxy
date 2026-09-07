@@ -878,7 +878,20 @@ app.get('/auth/jira/callback', async function(req, res) {
     var resourcesRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/oauth/token/accessible-resources', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
     var cloudId = resourcesRes.data[0] ? resourcesRes.data[0].id  : null;
     var jiraUrl = resourcesRes.data[0] ? resourcesRes.data[0].url : null;
-    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl });
+    // Fetch the actual signed-in Jira account's identity (accountId is stable
+    // and unique per Atlassian account) so tickets/usage can be scoped to the
+    // real connected account rather than just the Jira site.
+    var jiraAccountId = null, jiraEmail = null;
+    if (cloudId) {
+      try {
+        var meRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/myself', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
+        jiraAccountId = meRes.data && meRes.data.accountId ? meRes.data.accountId : null;
+        jiraEmail = meRes.data && meRes.data.emailAddress ? meRes.data.emailAddress : null;
+      } catch (meErr) {
+        console.error('[JIRA] Failed to fetch /myself:', meErr.message);
+      }
+    }
+    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail });
     res.send(successPage(pluginCode, 'Jira'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
