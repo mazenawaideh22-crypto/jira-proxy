@@ -871,6 +871,18 @@ function httpsRequest(options, body) {
 }
 
 // ─── JIRA AUTH ───────────────────────────────────────────────────────────────
+app.get('/auth/jira', rateLimiter(10), async function(req, res) {
+  var state = crypto.randomBytes(16).toString('hex');
+  pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
+  var url = 'https://auth.atlassian.com/authorize' +
+    '?audience=api.atlassian.com' +
+    '&client_id=' + JIRA_CLIENT_ID +
+    '&scope=' + encodeURIComponent('read:jira-work write:jira-work read:jira-user offline_access') +
+    '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/jira/callback') +
+    '&state=' + state + '&response_type=code';
+  res.redirect(url);
+});
+
 app.get('/auth/jira/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
   if (!code) return res.status(400).send('<h2>Error: No code</h2>');
@@ -886,6 +898,7 @@ app.get('/auth/jira/callback', async function(req, res) {
     var jiraUrl = resourcesRes.data[0] ? resourcesRes.data[0].url : null;
     
     // ─── FIX: Always fetch the account ID from /myself ──────────────────
+    // This gives us the unique per-user account ID, not the workspace ID
     var jiraAccountId = null, jiraEmail = null;
     if (cloudId) {
       try {
@@ -908,7 +921,6 @@ app.get('/auth/jira/callback', async function(req, res) {
     // This is less ideal but better than using cloudId alone
     var finalUserId = jiraAccountId;
     if (!finalUserId) {
-      // Fallback: cloudId + unique suffix
       var fallbackSuffix = crypto.randomBytes(4).toString('hex');
       finalUserId = 'jira-' + cloudId + '-' + fallbackSuffix;
       console.warn('[JIRA] Using fallback userId:', finalUserId);
@@ -955,10 +967,50 @@ app.get('/auth/gitlab/callback', async function(req, res) {
       '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/gitlab/callback');
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
-    var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id });
+    
+    // ─── FIX: Always fetch the user ID from /api/v4/user ──────────────
+    // GitLab's user ID is unique per user, not shared like Jira's workspace ID
+    var userRes = await httpsRequest({ 
+      hostname: 'gitlab.com', 
+      path: '/api/v4/user', 
+      method: 'GET', 
+      headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } 
+    });
+    
+    if (userRes.status !== 200 || !userRes.data.id) {
+      console.error('[GITLAB] Failed to fetch user:', userRes.status, JSON.stringify(userRes.data));
+      // Fallback: use username + random suffix
+      var fallbackUserId = 'gitlab-' + (userRes.data.username || 'unknown') + '-' + crypto.randomBytes(4).toString('hex');
+      console.warn('[GITLAB] Using fallback userId:', fallbackUserId);
+      var pluginCode = generateCode({ 
+        provider: 'gitlab', 
+        accessToken: tokenRes.data.access_token, 
+        refreshToken: tokenRes.data.refresh_token, 
+        username: userRes.data.username, 
+        name: userRes.data.name, 
+        userId: fallbackUserId 
+      });
+      res.send(successPage(pluginCode, 'GitLab'));
+      return;
+    }
+    
+    // ─── Use the unique GitLab user ID ──────────────────────────────────
+    var gitlabUserId = String(userRes.data.id);  // This is unique per GitLab user
+    console.log('[GITLAB] User ID:', gitlabUserId, 'Username:', userRes.data.username);
+    
+    var pluginCode = generateCode({ 
+      provider: 'gitlab', 
+      accessToken: tokenRes.data.access_token, 
+      refreshToken: tokenRes.data.refresh_token, 
+      username: userRes.data.username, 
+      name: userRes.data.name, 
+      userId: gitlabUserId  // ← Unique per GitLab user
+    });
     res.send(successPage(pluginCode, 'GitLab'));
-  } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
+  } catch(e) { 
+    console.error('[GITLAB] Callback error:', e.message);
+    res.status(500).send('<h2>Error: ' + e.message + '</h2>'); 
+  }
 });
 
 // ─── AUTH TOKEN EXCHANGE ─────────────────────────────────────────────────────
