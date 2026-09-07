@@ -48,7 +48,7 @@ app.options('*', function(req, res) {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
 
-// Lightweight healthcheck target — if Railway's Healthcheck Path is set to
+// Lightweight healthcheck endpoint — if Railway's Healthcheck Path is set to
 // something that doesn't exist (or to '/', which does a full file read of
 // ui.html), a failing/slow check can cause Railway to kill and restart the
 // container in a loop even though the app is otherwise fine. Point Railway's
@@ -224,12 +224,21 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
     return res.status(400).json({ error: 'Subject and message are required' });
   }
   
+  // ─── FIX: Reject anonymous submissions ──────────────────────────────
+  // This prevents users who aren't properly identified from creating tickets
+  // that appear under a shared 'anonymous' ID that other users can see.
+  if (!userId || userId === 'anonymous' || (typeof userId === 'string' && userId.startsWith('anon-'))) {
+    return res.status(400).json({ 
+      error: 'Please connect your Jira or GitLab account first before submitting a support ticket.' 
+    });
+  }
+  
   var ticket = {
     id: ticketIdCounter++,
     subject: subject.substring(0, 200),
     message: message.substring(0, 5000),
     email: email || 'anonymous',
-    userId: userId || 'anonymous',
+    userId: userId,
     priority: priority || 'medium',
     status: 'new',
     createdAt: new Date().toISOString(),
@@ -248,6 +257,15 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
 app.get('/api/support/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId || 'anonymous';
+  
+  // ─── FIX: Return empty array for anonymous or device-tied IDs ──────
+  // This ensures that users who aren't properly identified never see any
+  // tickets, including the ones they might have submitted when their ID
+  // wasn't properly resolved.
+  if (!userId || userId === 'anonymous' || (typeof userId === 'string' && userId.startsWith('anon-'))) {
+    return res.json({ tickets: [] });
+  }
+  
   var userTickets = supportTickets.filter(function(t) { 
     return t.userId === userId || t.email === userId;
   });
