@@ -871,18 +871,6 @@ function httpsRequest(options, body) {
 }
 
 // ─── JIRA AUTH ───────────────────────────────────────────────────────────────
-app.get('/auth/jira', rateLimiter(10), async function(req, res) {
-  var state = crypto.randomBytes(16).toString('hex');
-  pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
-  var url = 'https://auth.atlassian.com/authorize' +
-    '?audience=api.atlassian.com' +
-    '&client_id=' + JIRA_CLIENT_ID +
-    '&scope=' + encodeURIComponent('read:jira-work write:jira-work read:jira-user offline_access') +
-    '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/jira/callback') +
-    '&state=' + state + '&response_type=code';
-  res.redirect(url);
-});
-
 app.get('/auth/jira/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
   if (!code) return res.status(400).send('<h2>Error: No code</h2>');
@@ -896,22 +884,50 @@ app.get('/auth/jira/callback', async function(req, res) {
     var resourcesRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/oauth/token/accessible-resources', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
     var cloudId = resourcesRes.data[0] ? resourcesRes.data[0].id  : null;
     var jiraUrl = resourcesRes.data[0] ? resourcesRes.data[0].url : null;
-    // Fetch the actual signed-in Jira account's identity (accountId is stable
-    // and unique per Atlassian account) so tickets/usage can be scoped to the
-    // real connected account rather than just the Jira site.
+    
+    // ─── FIX: Always fetch the account ID from /myself ──────────────────
     var jiraAccountId = null, jiraEmail = null;
     if (cloudId) {
       try {
-        var meRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/myself', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
+        var meRes = await httpsRequest({ 
+          hostname: 'api.atlassian.com', 
+          path: '/ex/jira/' + cloudId + '/rest/api/3/myself', 
+          method: 'GET', 
+          headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } 
+        });
         jiraAccountId = meRes.data && meRes.data.accountId ? meRes.data.accountId : null;
         jiraEmail = meRes.data && meRes.data.emailAddress ? meRes.data.emailAddress : null;
+        console.log('[JIRA] Account ID:', jiraAccountId);
       } catch (meErr) {
         console.error('[JIRA] Failed to fetch /myself:', meErr.message);
       }
     }
-    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail });
+    
+    // ─── FIX: Use a fallback if account ID is not available ─────────────
+    // If /myself fails, use a combination of cloudId + a random suffix
+    // This is less ideal but better than using cloudId alone
+    var finalUserId = jiraAccountId;
+    if (!finalUserId) {
+      // Fallback: cloudId + unique suffix
+      var fallbackSuffix = crypto.randomBytes(4).toString('hex');
+      finalUserId = 'jira-' + cloudId + '-' + fallbackSuffix;
+      console.warn('[JIRA] Using fallback userId:', finalUserId);
+    }
+    
+    var pluginCode = generateCode({ 
+      provider: 'jira', 
+      accessToken: tokenRes.data.access_token, 
+      refreshToken: tokenRes.data.refresh_token, 
+      cloudId: cloudId, 
+      jiraUrl: jiraUrl, 
+      userId: finalUserId,  // ← Unique per Jira user
+      email: jiraEmail 
+    });
     res.send(successPage(pluginCode, 'Jira'));
-  } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
+  } catch(e) { 
+    console.error('[JIRA] Callback error:', e.message);
+    res.status(500).send('<h2>Error: ' + e.message + '</h2>'); 
+  }
 });
 
 // ─── GITLAB AUTH ─────────────────────────────────────────────────────────────
