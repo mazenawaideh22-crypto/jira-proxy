@@ -5,11 +5,57 @@ const https   = require('https');
 const crypto  = require('crypto');
 const path    = require('path');
 const helmet  = require('helmet');
+const { Pool } = require('pg');
 
 const app = express();
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
+// ─── POSTGRESQL SETUP ────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Create tables if they don't exist
+async function initDatabase() {
+  try {
+    // Support tickets table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_tickets (
+        id SERIAL PRIMARY KEY,
+        subject TEXT NOT NULL,
+        message TEXT NOT NULL,
+        email TEXT,
+        user_id TEXT NOT NULL,
+        priority TEXT DEFAULT 'medium',
+        status TEXT DEFAULT 'new',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        replies JSONB DEFAULT '[]',
+        attachments JSONB DEFAULT '[]'
+      )
+    `);
+    
+    // Add index for faster queries by user_id
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_tickets_user_id ON support_tickets(user_id)
+    `);
+    
+    // Add index for email lookups
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_tickets_email ON support_tickets(email)
+    `);
+    
+    console.log('[DB] Tables ready');
+  } catch (e) {
+    console.error('[DB] Init failed:', e.message);
+  }
+}
+
+// Initialize database on startup
+initDatabase();
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
 var _rateCounts = {};
@@ -48,14 +94,10 @@ app.options('*', function(req, res) {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
 
-// Lightweight healthcheck endpoint — if Railway's Healthcheck Path is set to
-// something that doesn't exist (or to '/', which does a full file read of
-// ui.html), a failing/slow check can cause Railway to kill and restart the
-// container in a loop even though the app is otherwise fine. Point Railway's
-// Healthcheck Path (Settings → Deploy → Healthcheck Path) at '/health'.
+// Lightweight healthcheck endpoint
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// ─── PRIVACY POLICY & TERMS (public, required for Atlassian/Figma listings) ──
+// ─── PRIVACY POLICY & TERMS ──────────────────────────────────────────────────
 app.get('/privacy', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html lang="en">
@@ -158,57 +200,9 @@ const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET;
 const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-production-ec4e.up.railway.app';
 const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
 
-// ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
+// ─── IN-MEMORY STORES (only for OAuth pending codes/states) ────────────────
 var pendingCodes  = {};
 var pendingStates = {};
-
-// ─── PERSISTED STORE: SUPPORT TICKETS ────────────────────────────────────────
-// These used to live only in a RAM array, so every redeploy (new Node process)
-// wiped all tickets. We now load them from disk on boot and save after every
-// write, so a deploy no longer destroys user data.
-//
-// IMPORTANT: this only survives redeploys if DATA_DIR points at a persistent
-// disk/volume. On platforms with an ephemeral filesystem (e.g. Railway without
-// a Volume attached), the file itself gets wiped on deploy just like RAM did.
-// In Railway: Project → Service → Settings → Volumes → add a volume mounted at
-// the path you set DATA_DIR to (e.g. /data), then set env var DATA_DIR=/data.
-// For a more robust/scalable long-term fix, migrate this to a real database
-// (Railway Postgres, etc.) instead of a JSON file.
-const fs = require('fs');
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const TICKETS_FILE = path.join(DATA_DIR, 'tickets.json');
-
-function loadTickets() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (fs.existsSync(TICKETS_FILE)) {
-      var raw = fs.readFileSync(TICKETS_FILE, 'utf8');
-      var parsed = JSON.parse(raw);
-      return {
-        tickets: Array.isArray(parsed.tickets) ? parsed.tickets : [],
-        nextId: parsed.nextId || 1
-      };
-    }
-  } catch (e) {
-    console.error('[TICKETS] Failed to load tickets.json, starting empty:', e.message);
-  }
-  return { tickets: [], nextId: 1 };
-}
-
-var _loaded = loadTickets();
-var supportTickets = _loaded.tickets;
-var ticketIdCounter = _loaded.nextId;
-
-function saveTickets() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(TICKETS_FILE, JSON.stringify({ tickets: supportTickets, nextId: ticketIdCounter }, null, 2));
-  } catch (e) {
-    console.error('[TICKETS] Failed to save tickets.json:', e.message);
-  }
-}
-
-console.log('[TICKETS] Loaded ' + supportTickets.length + ' ticket(s) from ' + TICKETS_FILE);
 
 setInterval(function() {
   var now = Date.now();
@@ -216,104 +210,171 @@ setInterval(function() {
   Object.keys(pendingStates).forEach(function(s) { if (now - pendingStates[s].createdAt > 10 * 60 * 1000) delete pendingStates[s]; });
 }, 60000);
 
-// ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-app.post('/api/support/tickets', express.json(), function(req, res) {
+// ─── SUPPORT TICKETS (PostgreSQL) ────────────────────────────────────────────
+
+// POST: Create a new support ticket
+app.post('/api/support/tickets', express.json(), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var { subject, message, email, userId, priority, attachments } = req.body;
+  
   if (!subject || !message) {
     return res.status(400).json({ error: 'Subject and message are required' });
   }
   
   // ─── FIX: Reject anonymous submissions ──────────────────────────────
-  // This prevents users who aren't properly identified from creating tickets
-  // that appear under a shared 'anonymous' ID that other users can see.
   if (!userId || userId === 'anonymous' || (typeof userId === 'string' && userId.startsWith('anon-'))) {
     return res.status(400).json({ 
       error: 'Please connect your Jira or GitLab account first before submitting a support ticket.' 
     });
   }
   
-  var ticket = {
-    id: ticketIdCounter++,
-    subject: subject.substring(0, 200),
-    message: message.substring(0, 5000),
-    email: email || 'anonymous',
-    userId: userId,
-    priority: priority || 'medium',
-    status: 'new',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    replies: [],
-    attachments: attachments || []
-  };
-  
-  supportTickets.push(ticket);
-  saveTickets();
-  console.log('[SUPPORT] New ticket #' + ticket.id + ' from userId: ' + ticket.userId + ' priority: ' + ticket.priority + ' attachments: ' + (attachments ? attachments.length : 0));
-  
-  res.json({ success: true, ticketId: ticket.id });
+  try {
+    const result = await pool.query(
+      `INSERT INTO support_tickets (subject, message, email, user_id, priority, status, attachments)
+       VALUES ($1, $2, $3, $4, $5, 'new', $6)
+       RETURNING id`,
+      [
+        subject.substring(0, 200),
+        message.substring(0, 5000),
+        email || 'anonymous',
+        userId,
+        priority || 'medium',
+        JSON.stringify(attachments || [])
+      ]
+    );
+    
+    const ticketId = result.rows[0].id;
+    console.log('[SUPPORT] New ticket #' + ticketId + ' from userId: ' + userId);
+    res.json({ success: true, ticketId: ticketId });
+  } catch (e) {
+    console.error('[SUPPORT] Error creating ticket:', e.message);
+    res.status(500).json({ error: 'Failed to create ticket: ' + e.message });
+  }
 });
 
-app.get('/api/support/tickets', function(req, res) {
+// GET: Get tickets for a specific user
+app.get('/api/support/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId = req.query.userId || 'anonymous';
   
-  // ─── FIX: Return empty array for anonymous or device-tied IDs ──────
-  // This ensures that users who aren't properly identified never see any
-  // tickets, including the ones they might have submitted when their ID
-  // wasn't properly resolved.
+  // ─── FIX: Return empty array for anonymous users ────────────────────
   if (!userId || userId === 'anonymous' || (typeof userId === 'string' && userId.startsWith('anon-'))) {
     return res.json({ tickets: [] });
   }
   
-  var userTickets = supportTickets.filter(function(t) { 
-    return t.userId === userId || t.email === userId;
-  });
-  res.json({ tickets: userTickets });
+  try {
+    // Only return tickets that belong to this specific user
+    const result = await pool.query(
+      `SELECT * FROM support_tickets 
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    
+    const tickets = result.rows.map(row => ({
+      id: row.id,
+      subject: row.subject,
+      message: row.message,
+      email: row.email,
+      userId: row.user_id,
+      priority: row.priority,
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      replies: row.replies || [],
+      attachments: row.attachments || []
+    }));
+    
+    res.json({ tickets: tickets });
+  } catch (e) {
+    console.error('[SUPPORT] Error fetching tickets:', e.message);
+    res.status(500).json({ error: 'Failed to fetch tickets' });
+  }
 });
 
-app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
+// POST: Add a reply to a ticket
+app.post('/api/support/tickets/:id/reply', express.json(), async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
   var { message, isAdmin, status } = req.body;
   var VALID_STATUSES = ['new', 'in_progress', 'resolved', 'closed'];
   
-  var ticket = supportTickets.find(function(t) { return t.id === ticketId; });
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-  
-  ticket.replies.push({
-    message: message,
-    isAdmin: isAdmin || false,
-    createdAt: new Date().toISOString()
-  });
-  ticket.updatedAt = new Date().toISOString();
-  if (isAdmin) {
-    if (status && VALID_STATUSES.indexOf(status) !== -1) {
-      // Explicit status change from Resolve/Close buttons — always respect it.
-      ticket.status = status;
-    } else if (ticket.status === 'new') {
-      // Plain reply with no explicit status: just bump a fresh ticket to
-      // in_progress. Don't clobber an already resolved/closed ticket just
-      // because the admin sent a follow-up note.
-      ticket.status = 'in_progress';
-    }
+  if (!message) {
+    return res.status(400).json({ error: 'Reply message is required' });
   }
-  saveTickets();
   
-  res.json({ success: true });
+  try {
+    // Get current ticket
+    const ticketResult = await pool.query(
+      'SELECT * FROM support_tickets WHERE id = $1',
+      [ticketId]
+    );
+    
+    if (ticketResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    
+    const ticket = ticketResult.rows[0];
+    const replies = ticket.replies || [];
+    
+    // Add reply
+    replies.push({
+      message: message,
+      isAdmin: isAdmin || false,
+      createdAt: new Date().toISOString()
+    });
+    
+    // Determine new status
+    let newStatus = ticket.status;
+    if (isAdmin) {
+      if (status && VALID_STATUSES.indexOf(status) !== -1) {
+        newStatus = status;
+      } else if (ticket.status === 'new') {
+        newStatus = 'in_progress';
+      }
+    }
+    
+    await pool.query(
+      `UPDATE support_tickets 
+       SET replies = $1, status = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      [JSON.stringify(replies), newStatus, ticketId]
+    );
+    
+    console.log('[SUPPORT] Reply added to ticket #' + ticketId);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[SUPPORT] Error adding reply:', e.message);
+    res.status(500).json({ error: 'Failed to add reply: ' + e.message });
+  }
 });
 
-app.delete('/api/support/tickets/:id', function(req, res) {
+// DELETE: Delete a ticket
+app.delete('/api/support/tickets/:id', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var ticketId = parseInt(req.params.id);
-  var index = supportTickets.findIndex(function(t) { return t.id === ticketId; });
-  if (index === -1) return res.status(404).json({ error: 'Ticket not found' });
-  supportTickets.splice(index, 1);
-  saveTickets();
-  res.json({ success: true });
+  
+  try {
+    const result = await pool.query(
+      'DELETE FROM support_tickets WHERE id = $1 RETURNING id',
+      [ticketId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    
+    console.log('[SUPPORT] Deleted ticket #' + ticketId);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[SUPPORT] Error deleting ticket:', e.message);
+    res.status(500).json({ error: 'Failed to delete ticket: ' + e.message });
+  }
 });
 
-// ─── DEVELOPER TICKET DASHBOARD ──────────────────────────────────────────────
+// ─── ADMIN DASHBOARD ─────────────────────────────────────────────────────────
+
+// Admin dashboard HTML (with PostgreSQL data)
 app.get('/admin/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   
@@ -351,7 +412,8 @@ app.get('/admin/tickets', function(req, res) {
     `);
   }
   
-  var html = `
+  // Serve the admin dashboard HTML with embedded JavaScript that fetches from /api/admin/tickets
+  res.send(`
   <!DOCTYPE html>
   <html>
   <head>
@@ -444,7 +506,6 @@ app.get('/admin/tickets', function(req, res) {
     <div class="container">
       <div class="header">
         <h1>🎫 Support Tickets</h1>
-       
       </div>
       
       <div class="stats" id="stats">
@@ -546,14 +607,15 @@ app.get('/admin/tickets', function(req, res) {
       }
       
       function fetchTickets() {
-        fetch('/api/support/tickets')
-          .then(r => r.json())
-          .then(data => {
+        var adminKey = new URLSearchParams(window.location.search).get('key');
+        fetch('/api/admin/tickets?key=' + encodeURIComponent(adminKey))
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
             allTickets = data.tickets || [];
             updateStats();
             renderTickets();
           })
-          .catch(err => {
+          .catch(function(err) {
             document.getElementById('ticketList').innerHTML = '<div class="empty-state">❌ Failed to load tickets: ' + err.message + '</div>';
           });
       }
@@ -612,9 +674,9 @@ app.get('/admin/tickets', function(req, res) {
           html += '</div>';
           html += '<div class="ticket-meta">';
           html += '<span>📧 ' + escapeHtml(t.email || 'anonymous') + '</span>';
-          html += '<span>🕐 ' + new Date(t.createdAt).toLocaleString() + '</span>';
-          html += '<span>🔄 Updated: ' + new Date(t.updatedAt).toLocaleString() + '</span>';
-          html += '<span>👤 ' + escapeHtml(t.userId || 'unknown') + '</span>';
+          html += '<span>🕐 ' + new Date(t.created_at).toLocaleString() + '</span>';
+          html += '<span>🔄 Updated: ' + new Date(t.updated_at).toLocaleString() + '</span>';
+          html += '<span>👤 ' + escapeHtml(t.user_id || 'unknown') + '</span>';
           html += '</div>';
           html += '<div class="ticket-message">' + escapeHtml(t.message) + '</div>';
           
@@ -708,8 +770,8 @@ app.get('/admin/tickets', function(req, res) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: text, isAdmin: true })
         })
-        .then(r => r.json())
-        .then(data => {
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
           if (data.success) {
             document.getElementById('reply-text-' + id).value = '';
             document.getElementById('reply-area-' + id).classList.remove('open');
@@ -718,7 +780,7 @@ app.get('/admin/tickets', function(req, res) {
             alert('Failed to send reply: ' + (data.error || 'unknown error'));
           }
         })
-        .catch(err => alert('Error: ' + err.message));
+        .catch(function(err) { alert('Error: ' + err.message); });
       }
       
       function updateStatus(id, status) {
@@ -733,8 +795,8 @@ app.get('/admin/tickets', function(req, res) {
             status: status
           })
         })
-        .then(r => r.json())
-        .then(data => {
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
           if (data.success) {
             var ticket = allTickets.find(function(t) { return t.id === id; });
             if (ticket) ticket.status = status;
@@ -744,7 +806,7 @@ app.get('/admin/tickets', function(req, res) {
             alert('Failed to update status.');
           }
         })
-        .catch(err => alert('Error: ' + err.message));
+        .catch(function(err) { alert('Error: ' + err.message); });
       }
       
       function deleteTicket(id) {
@@ -753,8 +815,8 @@ app.get('/admin/tickets', function(req, res) {
         fetch('/api/support/tickets/' + id, {
           method: 'DELETE'
         })
-        .then(r => r.json())
-        .then(data => {
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
           if (data.success) {
             allTickets = allTickets.filter(function(t) { return t.id !== id; });
             renderTickets();
@@ -763,7 +825,7 @@ app.get('/admin/tickets', function(req, res) {
             alert('Failed to delete ticket.');
           }
         })
-        .catch(err => alert('Error: ' + err.message));
+        .catch(function(err) { alert('Error: ' + err.message); });
       }
       
       // Auto-refresh every 30 seconds
@@ -774,13 +836,11 @@ app.get('/admin/tickets', function(req, res) {
     </script>
   </body>
   </html>
-  `;
-  
-  res.send(html);
+  `);
 });
 
-// Admin API endpoint to get all tickets (for the dashboard)
-app.get('/api/admin/tickets', function(req, res) {
+// ─── ADMIN API (for the dashboard) ───────────────────────────────────────────
+app.get('/api/admin/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var adminKey = req.query.key;
   
@@ -788,7 +848,31 @@ app.get('/api/admin/tickets', function(req, res) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   
-  res.json({ tickets: supportTickets });
+  try {
+    // Get ALL tickets from PostgreSQL (no user filter)
+    const result = await pool.query(
+      'SELECT * FROM support_tickets ORDER BY created_at DESC'
+    );
+    
+    const tickets = result.rows.map(row => ({
+      id: row.id,
+      subject: row.subject,
+      message: row.message,
+      email: row.email,
+      userId: row.user_id,
+      priority: row.priority,
+      status: row.status,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      replies: row.replies || [],
+      attachments: row.attachments || []
+    }));
+    
+    res.json({ tickets: tickets });
+  } catch (e) {
+    console.error('[ADMIN] Error fetching tickets:', e.message);
+    res.status(500).json({ error: 'Failed to fetch tickets: ' + e.message });
+  }
 });
 
 // ─── WHAT'S NEW ──────────────────────────────────────────────────────────────
@@ -796,6 +880,19 @@ app.get('/api/whats-new', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   res.json({
     updates: [
+      {
+        version: '1.2.0',
+        date: '2026-09-07',
+        title: 'Privacy & Security Update',
+        items: [
+          'Fixed support ticket privacy issue',
+          'Jira users now correctly identified by account ID (unique per user)',
+          'GitLab users correctly identified by user ID',
+          'Users can no longer see other users\' support tickets',
+          'PostgreSQL database for reliable ticket storage',
+          'Admin dashboard now shows all tickets for support team'
+        ]
+      },
       {
         version: '1.1.0',
         date: '2026-07-30',
@@ -898,7 +995,6 @@ app.get('/auth/jira/callback', async function(req, res) {
     var jiraUrl = resourcesRes.data[0] ? resourcesRes.data[0].url : null;
     
     // ─── FIX: Always fetch the account ID from /myself ──────────────────
-    // This gives us the unique per-user account ID, not the workspace ID
     var jiraAccountId = null, jiraEmail = null;
     if (cloudId) {
       try {
@@ -916,9 +1012,7 @@ app.get('/auth/jira/callback', async function(req, res) {
       }
     }
     
-    // ─── FIX: Use a fallback if account ID is not available ─────────────
-    // If /myself fails, use a combination of cloudId + a random suffix
-    // This is less ideal but better than using cloudId alone
+    // ─── FIX: Use unique user ID, not workspace ID ──────────────────────
     var finalUserId = jiraAccountId;
     if (!finalUserId) {
       var fallbackSuffix = crypto.randomBytes(4).toString('hex');
@@ -932,7 +1026,7 @@ app.get('/auth/jira/callback', async function(req, res) {
       refreshToken: tokenRes.data.refresh_token, 
       cloudId: cloudId, 
       jiraUrl: jiraUrl, 
-      userId: finalUserId,  // ← Unique per Jira user
+      userId: finalUserId,
       email: jiraEmail 
     });
     res.send(successPage(pluginCode, 'Jira'));
@@ -968,8 +1062,6 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
     
-    // ─── FIX: Always fetch the user ID from /api/v4/user ──────────────
-    // GitLab's user ID is unique per user, not shared like Jira's workspace ID
     var userRes = await httpsRequest({ 
       hostname: 'gitlab.com', 
       path: '/api/v4/user', 
@@ -979,7 +1071,6 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     
     if (userRes.status !== 200 || !userRes.data.id) {
       console.error('[GITLAB] Failed to fetch user:', userRes.status, JSON.stringify(userRes.data));
-      // Fallback: use username + random suffix
       var fallbackUserId = 'gitlab-' + (userRes.data.username || 'unknown') + '-' + crypto.randomBytes(4).toString('hex');
       console.warn('[GITLAB] Using fallback userId:', fallbackUserId);
       var pluginCode = generateCode({ 
@@ -995,7 +1086,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     }
     
     // ─── Use the unique GitLab user ID ──────────────────────────────────
-    var gitlabUserId = String(userRes.data.id);  // This is unique per GitLab user
+    var gitlabUserId = String(userRes.data.id);
     console.log('[GITLAB] User ID:', gitlabUserId, 'Username:', userRes.data.username);
     
     var pluginCode = generateCode({ 
@@ -1004,7 +1095,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
       refreshToken: tokenRes.data.refresh_token, 
       username: userRes.data.username, 
       name: userRes.data.name, 
-      userId: gitlabUserId  // ← Unique per GitLab user
+      userId: gitlabUserId
     });
     res.send(successPage(pluginCode, 'GitLab'));
   } catch(e) { 
@@ -1560,9 +1651,6 @@ app.post('/comment', async function(req, res) {
 });
 
 // ─── START ───────────────────────────────────────────────────────────────────
-// Log SIGTERM explicitly so the next restart-loop shows *when* Railway is
-// asking the process to stop, which helps distinguish "platform killed us"
-// (healthcheck/OOM) from an actual in-app crash.
 process.on('SIGTERM', function() {
   console.log('[SHUTDOWN] Received SIGTERM, exiting.');
   process.exit(0);
