@@ -247,9 +247,18 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
 
 app.get('/api/support/tickets', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.query.userId || 'anonymous';
-  var userTickets = supportTickets.filter(function(t) { 
-    return t.userId === userId || t.email === userId;
+  var userId = req.query.userId;
+  // No caller-supplied identity (e.g. the plugin hasn't finished resolving
+  // its real user id yet) — return nothing rather than falling back to a
+  // shared 'anonymous' bucket. Previously this defaulted to 'anonymous' AND
+  // matched on `t.email === userId`, so any ticket submitted with a blank
+  // email (email defaults to 'anonymous') was returned to *any* caller with
+  // no/anonymous userId — a cross-account data leak.
+  if (!userId) {
+    return res.json({ tickets: [] });
+  }
+  var userTickets = supportTickets.filter(function(t) {
+    return t.userId === userId;
   });
   res.json({ tickets: userTickets });
 });
