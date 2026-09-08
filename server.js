@@ -52,14 +52,9 @@ app.options('*', function(req, res) {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
 
-// Lightweight healthcheck target — if Railway's Healthcheck Path is set to
-// something that doesn't exist (or to '/', which does a full file read of
-// ui.html), a failing/slow check can cause Railway to kill and restart the
-// container in a loop even though the app is otherwise fine. Point Railway's
-// Healthcheck Path (Settings → Deploy → Healthcheck Path) at '/health'.
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// ─── PRIVACY POLICY & TERMS (public, required for Atlassian/Figma listings) ──
+// ─── PRIVACY POLICY & TERMS ──────────────────────────────────────────────────
 app.get('/privacy', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html lang="en">
@@ -161,27 +156,13 @@ const GITLAB_CLIENT_ID     = process.env.GITLAB_CLIENT_ID;
 const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET;
 const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-production-ec4e.up.railway.app';
 const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
-// Used only to sign the private support-ticket identity returned during the
-// OAuth handoff. Prefer a dedicated SUPPORT_IDENTITY_SECRET in production;
-// the OAuth client secret is a stable server-only fallback for existing setups.
 const SUPPORT_IDENTITY_SECRET = process.env.SUPPORT_IDENTITY_SECRET || JIRA_CLIENT_SECRET || GITLAB_CLIENT_SECRET;
 
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
 var pendingStates = {};
 
-// ─── PERSISTED STORE: SUPPORT TICKETS ────────────────────────────────────────
-// These used to live only in a RAM array, so every redeploy (new Node process)
-// wiped all tickets. We now load them from disk on boot and save after every
-// write, so a deploy no longer destroys user data.
-//
-// IMPORTANT: this only survives redeploys if DATA_DIR points at a persistent
-// disk/volume. On platforms with an ephemeral filesystem (e.g. Railway without
-// a Volume attached), the file itself gets wiped on deploy just like RAM did.
-// In Railway: Project → Service → Settings → Volumes → add a volume mounted at
-// the path you set DATA_DIR to (e.g. /data), then set env var DATA_DIR=/data.
-// For a more robust/scalable long-term fix, migrate this to a real database
-// (Railway Postgres, etc.) instead of a JSON file.
+// ─── PERSISTED STORE: SUPPORT TICKETS ──────────────────────────────────────
 const fs = require('fs');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const TICKETS_FILE = path.join(DATA_DIR, 'tickets.json');
@@ -227,8 +208,6 @@ setInterval(function() {
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
 function getTicketOwnerKey(provider, userId, email) {
   var normalizedEmail = String(email || '').trim().toLowerCase();
-  // A verified email shared by both OAuth providers is the only case where
-  // accounts should be merged. Store a one-way hash, not the email itself.
   if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
     return 'email-' + crypto.createHash('sha256').update('support-owner:' + normalizedEmail).digest('hex');
   }
@@ -243,9 +222,6 @@ function createSupportIdentity(ownerKey) {
 }
 
 function getOAuthSubject(accessToken) {
-  // Atlassian OAuth access tokens normally carry the stable account id in
-  // their JWT `sub` claim. This is a fallback only when /myself is unavailable
-  // for a particular Jira site during the login handoff.
   try {
     var parts = String(accessToken || '').split('.');
     if (parts.length !== 3) return null;
@@ -256,8 +232,6 @@ function getOAuthSubject(accessToken) {
   }
 }
 
-// The browser never chooses an owner id. The server verifies this signed value,
-// which was issued only after the user completed Jira/GitLab OAuth.
 function authenticateSupportUser(req) {
   var identity = String(req.headers['x-support-identity'] || '');
   var separator = identity.lastIndexOf('.');
@@ -296,9 +270,6 @@ app.post('/api/support/tickets', async function(req, res) {
     message: message.substring(0, 5000),
     email: email || 'anonymous',
     userId: ownerId,
-    // Records created before the signed-identity implementation cannot be
-    // safely attributed after the fact. Version new records explicitly so
-    // only verifiably private tickets ever appear in a user's ticket list.
     ownerVersion: 4,
     priority: priority || 'medium',
     status: 'new',
@@ -353,12 +324,8 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   ticket.updatedAt = new Date().toISOString();
   if (isAdmin) {
     if (status && VALID_STATUSES.indexOf(status) !== -1) {
-      // Explicit status change from Resolve/Close buttons — always respect it.
       ticket.status = status;
     } else if (ticket.status === 'new') {
-      // Plain reply with no explicit status: just bump a fresh ticket to
-      // in_progress. Don't clobber an already resolved/closed ticket just
-      // because the admin sent a follow-up note.
       ticket.status = 'in_progress';
     }
   }
@@ -963,9 +930,6 @@ app.get('/auth/jira/callback', async function(req, res) {
     var resourcesRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/oauth/token/accessible-resources', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
     var cloudId = resourcesRes.data[0] ? resourcesRes.data[0].id  : null;
     var jiraUrl = resourcesRes.data[0] ? resourcesRes.data[0].url : null;
-    // Fetch the actual signed-in Jira account's identity (accountId is stable
-    // and unique per Atlassian account) so tickets/usage can be scoped to the
-    // real connected account rather than just the Jira site.
     var jiraAccountId = null, jiraEmail = null;
     try {
       var identityRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/me', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
@@ -1087,22 +1051,88 @@ app.post('/spaces', async function(req, res) {
   
   try {
     if (provider === 'gitlab') {
-      var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+      var userRes = await httpsRequest({ 
+        hostname: 'gitlab.com', 
+        path: '/api/v4/user', 
+        method: 'GET', 
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+      });
       
       if (userRes.status !== 200 || !userRes.data.id) {
-         return res.status(userRes.status || 401).json({ error: 'Could not fetch GitLab user profile' });
+        return res.status(userRes.status || 401).json({ error: 'Could not fetch GitLab user profile' });
       }
       
       var userId = userRes.data.id;
       
-      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
+      // --- GitLab pagination ---
+      var allProjects = [];
+      var page = 1;
+      var perPage = 50;
+      var hasMore = true;
+      var maxPages = 50; // Safety limit
       
-      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name, webUrl: p.web_url || '' }; }) });
+      while (hasMore && page <= maxPages) {
+        var glRes = await httpsRequest({ 
+          hostname: 'gitlab.com', 
+          path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=' + perPage + '&page=' + page,
+          method: 'GET', 
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+        });
+        if (glRes.status !== 200) break;
+        var data = glRes.data;
+        if (!Array.isArray(data) || data.length === 0) {
+          hasMore = false;
+        } else {
+          allProjects = allProjects.concat(data);
+          if (data.length < perPage) hasMore = false;
+          else page++;
+        }
+      }
+      
+      return res.json({ spaces: allProjects.map(function(p) { 
+        return { id: String(p.id), name: p.name, webUrl: p.web_url || '' }; 
+      }) });
     }
     
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-    res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
-  } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
+    // --- Jira pagination ---
+    var allProjects = [];
+    var startAt = 0;
+    var maxResults = 50;
+    var hasMore = true;
+    var maxPages = 50; // Safety limit
+    var pageCount = 0;
+    
+    while (hasMore && pageCount < maxPages) {
+      var jiraRes = await httpsRequest({ 
+        hostname: 'api.atlassian.com', 
+        path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=' + maxResults + '&startAt=' + startAt,
+        method: 'GET', 
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+      });
+      
+      if (jiraRes.status !== 200) break;
+      
+      var data = jiraRes.data;
+      var projects = data.values || [];
+      allProjects = allProjects.concat(projects);
+      pageCount++;
+      
+      // Check if we've fetched all
+      if (allProjects.length >= (data.total || 0) || projects.length < maxResults) {
+        hasMore = false;
+      } else {
+        startAt += maxResults;
+      }
+    }
+    
+    console.log('[SPACES] Loaded ' + allProjects.length + ' projects from Jira');
+    res.json({ spaces: allProjects.map(function(p) { 
+      return { id: p.key, name: p.name }; 
+    }) });
+  } catch(e) { 
+    console.error('[SPACES] Exception:', e.stack || e.message); 
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
@@ -1117,21 +1147,41 @@ app.post('/tickets', async function(req, res) {
       
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
       
-      var glRes = await httpsRequest({ 
-        hostname: 'gitlab.com', 
-        path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=50', 
-        method: 'GET', 
-        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
-      });
+      // --- GitLab pagination ---
+      var allIssues = [];
+      var page = 1;
+      var perPage = 50;
+      var hasMore = true;
+      var maxPages = 50; // Safety limit
       
-      console.log('[TICKETS] GitLab response status:', glRes.status);
-      
-      if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
-        console.error('[TICKETS] GitLab error:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
-        return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
+      while (hasMore && page <= maxPages) {
+        var glRes = await httpsRequest({ 
+          hostname: 'gitlab.com', 
+          path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=' + perPage + '&page=' + page,
+          method: 'GET', 
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+        });
+        
+        console.log('[TICKETS] GitLab response status:', glRes.status, 'page:', page);
+        
+        if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
+          console.error('[TICKETS] GitLab error:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
+          return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
+        }
+        
+        var issues = glRes.data;
+        if (issues.length === 0) {
+          hasMore = false;
+        } else {
+          allIssues = allIssues.concat(issues);
+          if (issues.length < perPage) hasMore = false;
+          else page++;
+        }
       }
       
-      var tickets = glRes.data.map(function(issue) {
+      console.log('[TICKETS] Loaded ' + allIssues.length + ' issues from GitLab');
+      
+      return res.json({ tickets: allIssues.map(function(issue) {
         return {
           id: issue.iid,
           title: issue.title,
@@ -1146,23 +1196,50 @@ app.post('/tickets', async function(req, res) {
           weight: issue.weight || '-',
           issueType: issue.issue_type || 'issue'
         };
-      });
-      
-      return res.json({ tickets: tickets });
+      }) });
     }
     
+    // --- Jira pagination ---
     var spaceId = req.body.spaceId;
-    var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
-    var jiraRes = await httpsRequest({ 
-      hostname: 'api.atlassian.com', 
-      path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql + '&maxResults=30&fields=summary,description,status,priority,assignee,reporter,issuetype,created', 
-      method: 'GET', 
-      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
-    });
+    var allIssues = [];
+    var startAt = 0;
+    var maxResults = 50;
+    var hasMore = true;
+    var maxPages = 50; // Safety limit
+    var pageCount = 0;
+    var baseJql = spaceId 
+      ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' 
+      : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
     
-    if (!jiraRes.data.issues) return res.status(500).json({ error: 'No issues', raw: jiraRes.data });
+    console.log('[TICKETS] Jira jql:', decodeURIComponent(baseJql));
     
-    var tickets = jiraRes.data.issues.map(function(issue) {
+    while (hasMore && pageCount < maxPages) {
+      var jiraRes = await httpsRequest({ 
+        hostname: 'api.atlassian.com', 
+        path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + baseJql + '&maxResults=' + maxResults + '&startAt=' + startAt + '&fields=summary,description,status,priority,assignee,reporter,issuetype,created',
+        method: 'GET', 
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
+      });
+      
+      if (jiraRes.status !== 200 || !jiraRes.data.issues) {
+        return res.status(500).json({ error: 'No issues', raw: jiraRes.data });
+      }
+      
+      var issues = jiraRes.data.issues;
+      allIssues = allIssues.concat(issues);
+      pageCount++;
+      
+      // Check if we've fetched all
+      if (allIssues.length >= (jiraRes.data.total || 0) || issues.length < maxResults) {
+        hasMore = false;
+      } else {
+        startAt += maxResults;
+      }
+    }
+    
+    console.log('[TICKETS] Loaded ' + allIssues.length + ' issues from Jira (total: ' + (jiraRes.data ? jiraRes.data.total : 'unknown') + ')');
+    
+    var tickets = allIssues.map(function(issue) {
       var desc = 'No description';
       try { 
         if (issue.fields.description && issue.fields.description.content) {
@@ -1567,9 +1644,6 @@ app.post('/comment', async function(req, res) {
 });
 
 // ─── START ───────────────────────────────────────────────────────────────────
-// Log SIGTERM explicitly so the next restart-loop shows *when* Railway is
-// asking the process to stop, which helps distinguish "platform killed us"
-// (healthcheck/OOM) from an actual in-app crash.
 process.on('SIGTERM', function() {
   console.log('[SHUTDOWN] Received SIGTERM, exiting.');
   process.exit(0);
