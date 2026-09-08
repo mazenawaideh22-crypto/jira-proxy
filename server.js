@@ -217,26 +217,63 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-app.post('/api/support/tickets', express.json(), function(req, res) {
+// Support tickets are private.  Do not use a user id supplied by the browser as
+// an access-control decision: it can be changed in DevTools or accidentally be
+// stale when an account is switched.  Instead, derive the owner from the OAuth
+// access token that the Figma plugin keeps in client storage.
+async function authenticateSupportUser(req) {
+  var auth = req.headers.authorization || '';
+  var match = auth.match(/^Bearer\s+(.+)$/i);
+  var provider = String(req.headers['x-support-provider'] || '').toLowerCase();
+  if (!match || !match[1] || (provider !== 'jira' && provider !== 'gitlab')) {
+    throw new Error('Authentication required');
+  }
+
+  var accessToken = match[1];
+  if (provider === 'gitlab') {
+    var gitlabUser = await httpsRequest({
+      hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+    });
+    if (!gitlabUser.data || !gitlabUser.data.id) throw new Error('Invalid GitLab session');
+    return 'gitlab-' + String(gitlabUser.data.id);
+  }
+
+  var cloudId = String(req.headers['x-jira-cloud-id'] || '');
+  // Jira's /myself endpoint is scoped to a cloud site.  Reject malformed ids
+  // rather than allowing arbitrary path fragments in a request URL.
+  if (!/^[A-Za-z0-9-]{8,100}$/.test(cloudId)) throw new Error('Jira site is required');
+  var jiraUser = await httpsRequest({
+    hostname: 'api.atlassian.com',
+    path: '/ex/jira/' + encodeURIComponent(cloudId) + '/rest/api/3/myself',
+    method: 'GET',
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+  });
+  if (!jiraUser.data || !jiraUser.data.accountId) throw new Error('Invalid Jira session');
+  return 'jira-' + String(jiraUser.data.accountId);
+}
+
+function supportAuthError(res, error) {
+  console.warn('[SUPPORT] Authentication failed:', error.message);
+  return res.status(401).json({ error: 'Please reconnect your Jira or GitLab account and try again.' });
+}
+
+app.post('/api/support/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var { subject, message, email, userId, priority, attachments } = req.body;
+  var { subject, message, email, priority, attachments } = req.body;
   if (!subject || !message) {
     return res.status(400).json({ error: 'Subject and message are required' });
   }
+  var ownerId;
+  try { ownerId = await authenticateSupportUser(req); }
+  catch (error) { return supportAuthError(res, error); }
   
   var ticket = {
     id: ticketIdCounter++,
     subject: subject.substring(0, 200),
     message: message.substring(0, 5000),
     email: email || 'anonymous',
-    // Never fall back to the literal shared string 'anonymous' here — if two
-    // different real users both submit without a resolved client userId
-    // (e.g. a client-side race, or a stale plugin build), they'd otherwise
-    // collide on the exact same identity bucket and be able to see each
-    // other's tickets. Each unidentified submission gets its own random id
-    // instead, so it's simply inaccessible to everyone (safe) rather than
-    // accessible to anyone else who also has no id (leak).
-    userId: userId || ('anon-' + crypto.randomUUID()),
+    userId: ownerId,
     priority: priority || 'medium',
     status: 'new',
     createdAt: new Date().toISOString(),
@@ -252,26 +289,29 @@ app.post('/api/support/tickets', express.json(), function(req, res) {
   res.json({ success: true, ticketId: ticket.id });
 });
 
-app.get('/api/support/tickets', function(req, res) {
+app.get('/api/support/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
-  var userId = req.query.userId;
-  // No caller-supplied identity (e.g. the plugin hasn't finished resolving
-  // its real user id yet) — return nothing rather than falling back to a
-  // shared 'anonymous' bucket. Previously this defaulted to 'anonymous' AND
-  // matched on `t.email === userId`, so any ticket submitted with a blank
-  // email (email defaults to 'anonymous') was returned to *any* caller with
-  // no/anonymous userId — a cross-account data leak.
-  if (!userId) {
-    return res.json({ tickets: [] });
-  }
+  var userId;
+  try { userId = await authenticateSupportUser(req); }
+  catch (error) { return supportAuthError(res, error); }
   var userTickets = supportTickets.filter(function(t) {
     return t.userId === userId;
   });
   res.json({ tickets: userTickets });
 });
 
+function requireAdmin(req, res) {
+  var adminKey = req.headers['x-admin-key'] || req.query.key;
+  if (adminKey !== ADMIN_KEY) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
 app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
+  if (!requireAdmin(req, res)) return;
   var ticketId = parseInt(req.params.id);
   var { message, isAdmin, status } = req.body;
   var VALID_STATUSES = ['new', 'in_progress', 'resolved', 'closed'];
@@ -303,6 +343,7 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
 
 app.delete('/api/support/tickets/:id', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
+  if (!requireAdmin(req, res)) return;
   var ticketId = parseInt(req.params.id);
   var index = supportTickets.findIndex(function(t) { return t.id === ticketId; });
   if (index === -1) return res.status(404).json({ error: 'Ticket not found' });
@@ -469,6 +510,7 @@ app.get('/admin/tickets', function(req, res) {
     <script>
       var allTickets = [];
       var currentFilter = 'all';
+      var adminKey = ${JSON.stringify(adminKey)};
       
       function escapeHtml(text) {
         if (!text) return '';
@@ -544,7 +586,7 @@ app.get('/admin/tickets', function(req, res) {
       }
       
       function fetchTickets() {
-        fetch('/api/support/tickets')
+        fetch('/api/admin/tickets?key=' + encodeURIComponent(adminKey))
           .then(r => r.json())
           .then(data => {
             allTickets = data.tickets || [];
@@ -703,7 +745,7 @@ app.get('/admin/tickets', function(req, res) {
         
         fetch('/api/support/tickets/' + id + '/reply', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
           body: JSON.stringify({ message: text, isAdmin: true })
         })
         .then(r => r.json())
@@ -724,7 +766,7 @@ app.get('/admin/tickets', function(req, res) {
         
         fetch('/api/support/tickets/' + id + '/reply', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
           body: JSON.stringify({ 
             message: 'Status updated to: ' + status,
             isAdmin: true,
@@ -749,7 +791,8 @@ app.get('/admin/tickets', function(req, res) {
         if (!confirm('Delete ticket #' + id + '? This cannot be undone.')) return;
         
         fetch('/api/support/tickets/' + id, {
-          method: 'DELETE'
+          method: 'DELETE',
+          headers: { 'X-Admin-Key': adminKey }
         })
         .then(r => r.json())
         .then(data => {
