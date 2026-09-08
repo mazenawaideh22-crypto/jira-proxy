@@ -963,34 +963,41 @@ function httpsRequest(options, body) {
   });
 }
 
-// ─── JIRA AUTH ───────────────────────────────────────────────────────────────
+// ─── JIRA AUTH ───────────────────────────────────────────────────────────────// ─── JIRA AUTH ───────────────────────────────────────────────────────────────
 app.get('/auth/jira', rateLimiter(10), async function(req, res) {
   var state = crypto.randomBytes(16).toString('hex');
   pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
   
-  // Note: The app MUST be installed on the user's Jira site from Atlassian Marketplace
-  // before they can authenticate. This OAuth flow will fail with "Access Denied"
-  // if the app is not installed.
+  // USE ONLY the scopes you added in the developer console
+  // These must match EXACTLY what's in your Permissions tab
+  var scopes = [
+    'read:jira-work',
+    'read:jira-user', 
+    'write:jira-work'
+  ];
+  
   var url = 'https://auth.atlassian.com/authorize' +
     '?audience=api.atlassian.com' +
     '&client_id=' + JIRA_CLIENT_ID +
-    '&scope=' + encodeURIComponent(
-      'read:jira-work write:jira-work read:jira-user read:me offline_access ' +
-      'read:jira-work:jira-software read:jira-work:jira-core'
-    ) +
+    '&scope=' + encodeURIComponent(scopes.join(' ')) +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/jira/callback') +
     '&state=' + state + 
-    '&response_type=code' +
-    '&prompt=consent';
+    '&response_type=code';
   
-  console.log('[AUTH] Jira OAuth URL generated with state:', state);
+  console.log('[AUTH] Jira OAuth URL generated');
+  console.log('[AUTH] Scopes requested:', scopes.join(' '));
+  console.log('[AUTH] Redirect URI:', BASE_URL + '/auth/jira/callback');
   res.redirect(url);
 });
 
 app.get('/auth/jira/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
+  
+  console.log('[AUTH] Callback received - code:', code ? 'present' : 'missing');
+  console.log('[AUTH] State:', state);
+  
   if (!code) {
-    console.error('[AUTH] Jira callback: No code provided');
+    console.error('[AUTH] No code received');
     return res.status(400).send(`
       <!DOCTYPE html>
       <html>
@@ -1007,7 +1014,8 @@ app.get('/auth/jira/callback', async function(req, res) {
       <body>
         <div class="card">
           <h1>❌ No Authorization Code</h1>
-          <p>We didn't receive an authorization code from Atlassian. Please try again.</p>
+          <p>We didn't receive an authorization code from Atlassian.</p>
+          <p style="font-size:12px;color:#3a3a4a;">Make sure the OAuth app is properly configured with the correct scopes.</p>
           <a href="${BASE_URL}" class="btn">Try Again</a>
         </div>
       </body>
@@ -1016,7 +1024,7 @@ app.get('/auth/jira/callback', async function(req, res) {
   }
   
   if (!state || !pendingStates[state] || pendingStates[state].provider !== 'jira') {
-    console.error('[AUTH] Jira callback: Invalid or expired state:', state);
+    console.error('[AUTH] Invalid or expired state:', state);
     return res.status(403).send(`
       <!DOCTYPE html>
       <html>
@@ -1033,7 +1041,7 @@ app.get('/auth/jira/callback', async function(req, res) {
       <body>
         <div class="card">
           <h1>❌ Invalid Session</h1>
-          <p>Your login session has expired or is invalid. Please go back and try again.</p>
+          <p>Your login session has expired or is invalid.</p>
           <a href="${BASE_URL}" class="btn">Try Again</a>
         </div>
       </body>
@@ -1044,6 +1052,8 @@ app.get('/auth/jira/callback', async function(req, res) {
   delete pendingStates[state];
   
   try {
+    console.log('[AUTH] Exchanging code for token...');
+    
     // Exchange code for token
     var body = JSON.stringify({ 
       grant_type: 'authorization_code', 
@@ -1063,8 +1073,10 @@ app.get('/auth/jira/callback', async function(req, res) {
       } 
     }, body);
     
+    console.log('[AUTH] Token response status:', tokenRes.status);
+    
     if (!tokenRes.data.access_token) {
-      console.error('[AUTH] Jira token error:', tokenRes.data);
+      console.error('[AUTH] Token error:', tokenRes.data);
       return res.status(400).send(`
         <!DOCTYPE html>
         <html>
@@ -1080,8 +1092,8 @@ app.get('/auth/jira/callback', async function(req, res) {
         </head>
         <body>
           <div class="card">
-            <h1>❌ Token Error</h1>
-            <p>Failed to exchange authorization code for access token. Please try again.</p>
+            <h1>❌ Token Exchange Failed</h1>
+            <p>Failed to exchange authorization code for access token.</p>
             <a href="${BASE_URL}" class="btn">Try Again</a>
           </div>
         </body>
@@ -1089,7 +1101,7 @@ app.get('/auth/jira/callback', async function(req, res) {
       `);
     }
     
-    console.log('[AUTH] Jira token obtained successfully');
+    console.log('[AUTH] Token obtained successfully');
     
     // Get accessible resources (sites the user has access to)
     var resourcesRes = await httpsRequest({ 
@@ -1102,58 +1114,39 @@ app.get('/auth/jira/callback', async function(req, res) {
       } 
     });
     
-    console.log('[AUTH] Jira accessible resources count:', resourcesRes.data ? resourcesRes.data.length : 0);
+    console.log('[AUTH] Accessible resources:', resourcesRes.data ? resourcesRes.data.length : 0);
     
-    // Get the first accessible resource (primary site)
     var cloudId = resourcesRes.data && resourcesRes.data.length > 0 ? resourcesRes.data[0].id : null;
     var jiraUrl = resourcesRes.data && resourcesRes.data.length > 0 ? resourcesRes.data[0].url : null;
     
-    // If no accessible resources, return error with helpful message about installing the app
     if (!cloudId) {
-      console.error('[AUTH] No accessible Jira resources found - app may not be installed');
+      console.error('[AUTH] No accessible Jira resources');
       return res.status(400).send(`
         <!DOCTYPE html>
         <html>
-        <head><title>Access Denied - App Not Installed</title>
+        <head><title>Access Denied</title>
         <style>
           body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-          .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 520px; width: 90%; text-align: center; }
+          .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
           h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
           p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
-          .steps { text-align: left; background: rgba(255,255,255,0.03); border-radius: 12px; padding: 16px 20px; margin: 16px 0; }
-          .steps li { color: #a0a0b0; margin-bottom: 8px; font-size: 13px; line-height: 1.5; }
-          .steps li strong { color: #18D4A7; }
-          .btn { display: inline-block; margin-top: 8px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+          .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
           .btn:hover { opacity: 0.85; }
-          .btn-secondary { background: transparent; border: 1px solid rgba(255,255,255,0.15); color: #f0f0f5; margin-left: 8px; }
-          .btn-secondary:hover { border-color: #18D4A7; color: #18D4A7; }
         </style>
         </head>
         <body>
           <div class="card">
-            <h1>⚠️ Structify App Not Installed</h1>
-            <p>To use Structify with Jira, the Structify app must be installed on your Jira site first.</p>
-            <div class="steps">
-              <p style="font-weight:600;color:#f0f0f5;margin-bottom:8px">📋 How to install:</p>
-              <ol style="padding-left:20px;margin:0">
-                <li>1. Go to <strong>Jira Settings</strong> → <strong>Apps</strong> → <strong>Find new apps</strong></li>
-                <li>2. Search for <strong>Structify</strong> in the Atlassian Marketplace</li>
-                <li>3. Click <strong>Install</strong> on your Jira site</li>
-                <li>4. Come back here and <strong>try logging in again</strong></li>
-              </ol>
-            </div>
-            <div style="margin-top:16px">
-              <a href="${BASE_URL}" class="btn">🔄 Try Again</a>
-              <a href="https://marketplace.atlassian.com/apps/1234567/structify" target="_blank" class="btn btn-secondary">📦 Open Marketplace</a>
-            </div>
-            <p style="font-size:12px;color:#3a3a4a;margin-top:16px">Need help? Contact your Jira admin to install the app.</p>
+            <h1>⚠️ No Jira Sites Found</h1>
+            <p>You don't have access to any Jira sites, or the Structify app hasn't been installed on your Jira site.</p>
+            <p style="font-size:12px;color:#3a3a4a;margin-top:8px">Contact your Jira admin to install the app.</p>
+            <a href="${BASE_URL}" class="btn">Try Again</a>
           </div>
         </body>
         </html>
       `);
     }
     
-    // Fetch the actual signed-in Jira account's identity
+    // Get user identity
     var jiraAccountId = null, jiraEmail = null;
     try {
       var identityRes = await httpsRequest({ 
@@ -1167,12 +1160,12 @@ app.get('/auth/jira/callback', async function(req, res) {
       });
       jiraAccountId = identityRes.data && (identityRes.data.account_id || identityRes.data.accountId) || null;
       jiraEmail = identityRes.data && identityRes.data.email || null;
-      console.log('[AUTH] Jira user identity:', jiraAccountId);
+      console.log('[AUTH] User identity:', jiraAccountId);
     } catch (identityErr) {
       console.error('[AUTH] Failed to fetch /me:', identityErr.message);
     }
     
-    // Also try to get the user from the specific cloud site
+    // Get user from site
     if (cloudId) {
       try {
         var meRes = await httpsRequest({ 
@@ -1186,18 +1179,16 @@ app.get('/auth/jira/callback', async function(req, res) {
         });
         if (meRes.data && meRes.data.accountId) jiraAccountId = meRes.data.accountId;
         if (meRes.data && meRes.data.emailAddress) jiraEmail = meRes.data.emailAddress;
-        console.log('[AUTH] Jira user from site:', jiraAccountId);
       } catch (meErr) {
         console.error('[AUTH] Failed to fetch /myself:', meErr.message);
       }
     }
     
-    // Fallback to OAuth subject claim
     if (!jiraAccountId) {
       jiraAccountId = getOAuthSubject(tokenRes.data.access_token);
     }
     
-    // Generate the plugin code
+    // Generate plugin code
     var pluginCode = generateCode({ 
       provider: 'jira', 
       accessToken: tokenRes.data.access_token, 
@@ -1209,11 +1200,11 @@ app.get('/auth/jira/callback', async function(req, res) {
       supportIdentity: createSupportIdentity(getTicketOwnerKey('jira', jiraAccountId, jiraEmail)) 
     });
     
-    console.log('[AUTH] Jira login successful for user:', jiraAccountId);
+    console.log('[AUTH] Login successful for user:', jiraAccountId);
     res.send(successPage(pluginCode, 'Jira'));
     
   } catch(e) { 
-    console.error('[AUTH] Jira callback error:', e.message, e.stack);
+    console.error('[AUTH] Error:', e.message, e.stack);
     res.status(500).send(`
       <!DOCTYPE html>
       <html>
@@ -1238,6 +1229,7 @@ app.get('/auth/jira/callback', async function(req, res) {
     `);
   }
 });
+
 
 // ─── GITLAB AUTH ─────────────────────────────────────────────────────────────
 app.get('/auth/gitlab', rateLimiter(10), async function(req, res) {
