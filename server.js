@@ -157,6 +157,10 @@ const GITLAB_CLIENT_ID     = process.env.GITLAB_CLIENT_ID;
 const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET;
 const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-production-ec4e.up.railway.app';
 const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
+// Used only to sign the private support-ticket identity returned during the
+// OAuth handoff. Prefer a dedicated SUPPORT_IDENTITY_SECRET in production;
+// the OAuth client secret is a stable server-only fallback for existing setups.
+const SUPPORT_IDENTITY_SECRET = process.env.SUPPORT_IDENTITY_SECRET || JIRA_CLIENT_SECRET || GITLAB_CLIENT_SECRET;
 
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
@@ -217,40 +221,31 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-// Support tickets are private.  Do not use a user id supplied by the browser as
-// an access-control decision: it can be changed in DevTools or accidentally be
-// stale when an account is switched.  Instead, derive the owner from the OAuth
-// access token that the Figma plugin keeps in client storage.
-async function authenticateSupportUser(req) {
-  var auth = req.headers.authorization || '';
-  var match = auth.match(/^Bearer\s+(.+)$/i);
-  var provider = String(req.headers['x-support-provider'] || '').toLowerCase();
-  if (!match || !match[1] || (provider !== 'jira' && provider !== 'gitlab')) {
-    throw new Error('Authentication required');
-  }
+function createSupportIdentity(provider, userId) {
+  if (!SUPPORT_IDENTITY_SECRET || !userId) return null;
+  var payload = provider + ':' + String(userId);
+  var signature = crypto.createHmac('sha256', SUPPORT_IDENTITY_SECRET).update(payload).digest('hex');
+  return payload + '.' + signature;
+}
 
-  var accessToken = match[1];
-  if (provider === 'gitlab') {
-    var gitlabUser = await httpsRequest({
-      hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
-    });
-    if (!gitlabUser.data || !gitlabUser.data.id) throw new Error('Invalid GitLab session');
-    return 'gitlab-' + String(gitlabUser.data.id);
+// The browser never chooses an owner id. The server verifies this signed value,
+// which was issued only after the user completed Jira/GitLab OAuth.
+function authenticateSupportUser(req) {
+  var identity = String(req.headers['x-support-identity'] || '');
+  var separator = identity.lastIndexOf('.');
+  if (separator < 1 || !SUPPORT_IDENTITY_SECRET) throw new Error('Authentication required');
+  var payload = identity.slice(0, separator);
+  var suppliedSignature = identity.slice(separator + 1);
+  var expectedSignature = crypto.createHmac('sha256', SUPPORT_IDENTITY_SECRET).update(payload).digest('hex');
+  if (suppliedSignature.length !== expectedSignature.length ||
+      !crypto.timingSafeEqual(Buffer.from(suppliedSignature), Buffer.from(expectedSignature))) {
+    throw new Error('Invalid support identity');
   }
-
-  var cloudId = String(req.headers['x-jira-cloud-id'] || '');
-  // Jira's /myself endpoint is scoped to a cloud site.  Reject malformed ids
-  // rather than allowing arbitrary path fragments in a request URL.
-  if (!/^[A-Za-z0-9-]{8,100}$/.test(cloudId)) throw new Error('Jira site is required');
-  var jiraUser = await httpsRequest({
-    hostname: 'api.atlassian.com',
-    path: '/ex/jira/' + encodeURIComponent(cloudId) + '/rest/api/3/myself',
-    method: 'GET',
-    headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
-  });
-  if (!jiraUser.data || !jiraUser.data.accountId) throw new Error('Invalid Jira session');
-  return 'jira-' + String(jiraUser.data.accountId);
+  var firstColon = payload.indexOf(':');
+  var provider = payload.slice(0, firstColon);
+  var userId = payload.slice(firstColon + 1);
+  if ((provider !== 'jira' && provider !== 'gitlab') || !userId) throw new Error('Invalid support identity');
+  return provider + '-' + userId;
 }
 
 function supportAuthError(res, error) {
@@ -265,7 +260,7 @@ app.post('/api/support/tickets', async function(req, res) {
     return res.status(400).json({ error: 'Subject and message are required' });
   }
   var ownerId;
-  try { ownerId = await authenticateSupportUser(req); }
+  try { ownerId = authenticateSupportUser(req); }
   catch (error) { return supportAuthError(res, error); }
   
   var ticket = {
@@ -292,7 +287,7 @@ app.post('/api/support/tickets', async function(req, res) {
 app.get('/api/support/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var userId;
-  try { userId = await authenticateSupportUser(req); }
+  try { userId = authenticateSupportUser(req); }
   catch (error) { return supportAuthError(res, error); }
   var userTickets = supportTickets.filter(function(t) {
     return t.userId === userId;
@@ -950,7 +945,7 @@ app.get('/auth/jira/callback', async function(req, res) {
         console.error('[JIRA] Failed to fetch /myself:', meErr.message);
       }
     }
-    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail });
+    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail, supportIdentity: createSupportIdentity('jira', jiraAccountId) });
     res.send(successPage(pluginCode, 'Jira'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
@@ -981,7 +976,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
     var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id });
+  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id, supportIdentity: createSupportIdentity('gitlab', userRes.data.id) });
     res.send(successPage(pluginCode, 'GitLab'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
