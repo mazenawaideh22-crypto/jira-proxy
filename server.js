@@ -225,9 +225,19 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-function createSupportIdentity(provider, userId) {
-  if (!SUPPORT_IDENTITY_SECRET || !userId) return null;
-  var payload = provider + ':' + String(userId);
+function getTicketOwnerKey(provider, userId, email) {
+  var normalizedEmail = String(email || '').trim().toLowerCase();
+  // A verified email shared by both OAuth providers is the only case where
+  // accounts should be merged. Store a one-way hash, not the email itself.
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return 'email-' + crypto.createHash('sha256').update('support-owner:' + normalizedEmail).digest('hex');
+  }
+  return provider + '-' + String(userId || '');
+}
+
+function createSupportIdentity(ownerKey) {
+  if (!SUPPORT_IDENTITY_SECRET || !ownerKey) return null;
+  var payload = 'v2|' + ownerKey;
   var signature = crypto.createHmac('sha256', SUPPORT_IDENTITY_SECRET).update(payload).digest('hex');
   return payload + '.' + signature;
 }
@@ -259,11 +269,10 @@ function authenticateSupportUser(req) {
       !crypto.timingSafeEqual(Buffer.from(suppliedSignature), Buffer.from(expectedSignature))) {
     throw new Error('Invalid support identity');
   }
-  var firstColon = payload.indexOf(':');
-  var provider = payload.slice(0, firstColon);
-  var userId = payload.slice(firstColon + 1);
-  if ((provider !== 'jira' && provider !== 'gitlab') || !userId) throw new Error('Invalid support identity');
-  return provider + '-' + userId;
+  if (!/^v2\|(email-[a-f0-9]{64}|(?:jira|gitlab)-.+)$/.test(payload)) {
+    throw new Error('Invalid support identity');
+  }
+  return payload.slice(3);
 }
 
 function supportAuthError(res, error) {
@@ -290,7 +299,7 @@ app.post('/api/support/tickets', async function(req, res) {
     // Records created before the signed-identity implementation cannot be
     // safely attributed after the fact. Version new records explicitly so
     // only verifiably private tickets ever appear in a user's ticket list.
-    ownerVersion: 3,
+    ownerVersion: 4,
     priority: priority || 'medium',
     status: 'new',
     createdAt: new Date().toISOString(),
@@ -312,7 +321,7 @@ app.get('/api/support/tickets', async function(req, res) {
   try { userId = authenticateSupportUser(req); }
   catch (error) { return supportAuthError(res, error); }
   var userTickets = supportTickets.filter(function(t) {
-    return t.ownerVersion === 3 && t.userId === userId;
+    return t.ownerVersion === 4 && t.userId === userId;
   });
   res.json({ tickets: userTickets });
 });
@@ -935,7 +944,7 @@ app.get('/auth/jira', rateLimiter(10), async function(req, res) {
   var url = 'https://auth.atlassian.com/authorize' +
     '?audience=api.atlassian.com' +
     '&client_id=' + JIRA_CLIENT_ID +
-    '&scope=' + encodeURIComponent('read:jira-work write:jira-work read:jira-user offline_access') +
+    '&scope=' + encodeURIComponent('read:jira-work write:jira-work read:jira-user read:me offline_access') +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/jira/callback') +
     '&state=' + state + '&response_type=code';
   res.redirect(url);
@@ -958,17 +967,24 @@ app.get('/auth/jira/callback', async function(req, res) {
     // and unique per Atlassian account) so tickets/usage can be scoped to the
     // real connected account rather than just the Jira site.
     var jiraAccountId = null, jiraEmail = null;
+    try {
+      var identityRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/me', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
+      jiraAccountId = identityRes.data && (identityRes.data.account_id || identityRes.data.accountId) || null;
+      jiraEmail = identityRes.data && identityRes.data.email || null;
+    } catch (identityErr) {
+      console.error('[JIRA] Failed to fetch /me:', identityErr.message);
+    }
     if (cloudId) {
       try {
         var meRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/myself', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-        jiraAccountId = meRes.data && meRes.data.accountId ? meRes.data.accountId : null;
-        jiraEmail = meRes.data && meRes.data.emailAddress ? meRes.data.emailAddress : null;
+        if (meRes.data && meRes.data.accountId) jiraAccountId = meRes.data.accountId;
+        if (meRes.data && meRes.data.emailAddress) jiraEmail = meRes.data.emailAddress;
       } catch (meErr) {
         console.error('[JIRA] Failed to fetch /myself:', meErr.message);
       }
     }
     if (!jiraAccountId) jiraAccountId = getOAuthSubject(tokenRes.data.access_token);
-    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail, supportIdentity: createSupportIdentity('jira', jiraAccountId) });
+    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail, supportIdentity: createSupportIdentity(getTicketOwnerKey('jira', jiraAccountId, jiraEmail)) });
     res.send(successPage(pluginCode, 'Jira'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
@@ -999,7 +1015,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
     var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id, supportIdentity: createSupportIdentity('gitlab', userRes.data.id) });
+  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id, email: userRes.data.email || null, supportIdentity: createSupportIdentity(getTicketOwnerKey('gitlab', userRes.data.id, userRes.data.email)) });
     res.send(successPage(pluginCode, 'GitLab'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
