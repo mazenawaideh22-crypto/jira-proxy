@@ -228,6 +228,20 @@ function createSupportIdentity(provider, userId) {
   return payload + '.' + signature;
 }
 
+function getOAuthSubject(accessToken) {
+  // Atlassian OAuth access tokens normally carry the stable account id in
+  // their JWT `sub` claim. This is a fallback only when /myself is unavailable
+  // for a particular Jira site during the login handoff.
+  try {
+    var parts = String(accessToken || '').split('.');
+    if (parts.length !== 3) return null;
+    var claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return claims && typeof claims.sub === 'string' && claims.sub ? claims.sub : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // The browser never chooses an owner id. The server verifies this signed value,
 // which was issued only after the user completed Jira/GitLab OAuth.
 function authenticateSupportUser(req) {
@@ -945,6 +959,7 @@ app.get('/auth/jira/callback', async function(req, res) {
         console.error('[JIRA] Failed to fetch /myself:', meErr.message);
       }
     }
+    if (!jiraAccountId) jiraAccountId = getOAuthSubject(tokenRes.data.access_token);
     var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail, supportIdentity: createSupportIdentity('jira', jiraAccountId) });
     res.send(successPage(pluginCode, 'Jira'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
