@@ -968,8 +968,9 @@ app.get('/auth/jira', rateLimiter(10), async function(req, res) {
   var state = crypto.randomBytes(16).toString('hex');
   pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
   
-  // CRITICAL FIX: Request access to ALL accessible resources, not just one site
-  // The user needs to authorize the app at the org/account level, not per-site
+  // Note: The app MUST be installed on the user's Jira site from Atlassian Marketplace
+  // before they can authenticate. This OAuth flow will fail with "Access Denied"
+  // if the app is not installed.
   var url = 'https://auth.atlassian.com/authorize' +
     '?audience=api.atlassian.com' +
     '&client_id=' + JIRA_CLIENT_ID +
@@ -990,12 +991,54 @@ app.get('/auth/jira/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
   if (!code) {
     console.error('[AUTH] Jira callback: No code provided');
-    return res.status(400).send('<h2>Error: No authorization code received</h2><p>Please try again.</p>');
+    return res.status(400).send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Error</title>
+      <style>
+        body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
+        h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
+        p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
+        .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+        .btn:hover { opacity: 0.85; }
+      </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>❌ No Authorization Code</h1>
+          <p>We didn't receive an authorization code from Atlassian. Please try again.</p>
+          <a href="${BASE_URL}" class="btn">Try Again</a>
+        </div>
+      </body>
+      </html>
+    `);
   }
   
   if (!state || !pendingStates[state] || pendingStates[state].provider !== 'jira') {
     console.error('[AUTH] Jira callback: Invalid or expired state:', state);
-    return res.status(403).send('<h2>Error: Invalid or expired state.</h2><p>Please go back and try again.</p>');
+    return res.status(403).send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Error</title>
+      <style>
+        body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
+        h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
+        p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
+        .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+        .btn:hover { opacity: 0.85; }
+      </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>❌ Invalid Session</h1>
+          <p>Your login session has expired or is invalid. Please go back and try again.</p>
+          <a href="${BASE_URL}" class="btn">Try Again</a>
+        </div>
+      </body>
+      </html>
+    `);
   }
   
   delete pendingStates[state];
@@ -1022,7 +1065,28 @@ app.get('/auth/jira/callback', async function(req, res) {
     
     if (!tokenRes.data.access_token) {
       console.error('[AUTH] Jira token error:', tokenRes.data);
-      return res.status(400).send('<h2>Token error</h2><p>' + JSON.stringify(tokenRes.data) + '</p>');
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Error</title>
+        <style>
+          body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+          .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
+          h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
+          p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
+          .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+          .btn:hover { opacity: 0.85; }
+        </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>❌ Token Error</h1>
+            <p>Failed to exchange authorization code for access token. Please try again.</p>
+            <a href="${BASE_URL}" class="btn">Try Again</a>
+          </div>
+        </body>
+        </html>
+      `);
     }
     
     console.log('[AUTH] Jira token obtained successfully');
@@ -1044,28 +1108,45 @@ app.get('/auth/jira/callback', async function(req, res) {
     var cloudId = resourcesRes.data && resourcesRes.data.length > 0 ? resourcesRes.data[0].id : null;
     var jiraUrl = resourcesRes.data && resourcesRes.data.length > 0 ? resourcesRes.data[0].url : null;
     
-    // If no accessible resources, return error with helpful message
+    // If no accessible resources, return error with helpful message about installing the app
     if (!cloudId) {
-      console.error('[AUTH] No accessible Jira resources found');
+      console.error('[AUTH] No accessible Jira resources found - app may not be installed');
       return res.status(400).send(`
         <!DOCTYPE html>
         <html>
-        <head><title>Access Denied</title>
+        <head><title>Access Denied - App Not Installed</title>
         <style>
           body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-          .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
+          .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 520px; width: 90%; text-align: center; }
           h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
           p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
-          .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+          .steps { text-align: left; background: rgba(255,255,255,0.03); border-radius: 12px; padding: 16px 20px; margin: 16px 0; }
+          .steps li { color: #a0a0b0; margin-bottom: 8px; font-size: 13px; line-height: 1.5; }
+          .steps li strong { color: #18D4A7; }
+          .btn { display: inline-block; margin-top: 8px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
           .btn:hover { opacity: 0.85; }
+          .btn-secondary { background: transparent; border: 1px solid rgba(255,255,255,0.15); color: #f0f0f5; margin-left: 8px; }
+          .btn-secondary:hover { border-color: #18D4A7; color: #18D4A7; }
         </style>
         </head>
         <body>
           <div class="card">
-            <h1>⚠️ No Jira Sites Found</h1>
-            <p>You don't have access to any Jira sites, or the Structify app hasn't been installed on your Jira site.</p>
-            <p style="font-size:12px;color:#3a3a4a;margin-top:8px">Make sure you have a Jira site and the Structify app is installed on it.</p>
-            <a href="${BASE_URL}" class="btn">Try Again</a>
+            <h1>⚠️ Structify App Not Installed</h1>
+            <p>To use Structify with Jira, the Structify app must be installed on your Jira site first.</p>
+            <div class="steps">
+              <p style="font-weight:600;color:#f0f0f5;margin-bottom:8px">📋 How to install:</p>
+              <ol style="padding-left:20px;margin:0">
+                <li>1. Go to <strong>Jira Settings</strong> → <strong>Apps</strong> → <strong>Find new apps</strong></li>
+                <li>2. Search for <strong>Structify</strong> in the Atlassian Marketplace</li>
+                <li>3. Click <strong>Install</strong> on your Jira site</li>
+                <li>4. Come back here and <strong>try logging in again</strong></li>
+              </ol>
+            </div>
+            <div style="margin-top:16px">
+              <a href="${BASE_URL}" class="btn">🔄 Try Again</a>
+              <a href="https://marketplace.atlassian.com/apps/1234567/structify" target="_blank" class="btn btn-secondary">📦 Open Marketplace</a>
+            </div>
+            <p style="font-size:12px;color:#3a3a4a;margin-top:16px">Need help? Contact your Jira admin to install the app.</p>
           </div>
         </body>
         </html>
