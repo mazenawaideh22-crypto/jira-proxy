@@ -287,6 +287,10 @@ app.post('/api/support/tickets', async function(req, res) {
     message: message.substring(0, 5000),
     email: email || 'anonymous',
     userId: ownerId,
+    // Records created before the signed-identity implementation cannot be
+    // safely attributed after the fact. Version new records explicitly so
+    // only verifiably private tickets ever appear in a user's ticket list.
+    ownerVersion: 2,
     priority: priority || 'medium',
     status: 'new',
     createdAt: new Date().toISOString(),
@@ -309,6 +313,7 @@ app.get('/api/support/tickets', async function(req, res) {
   catch (error) { return supportAuthError(res, error); }
   var userTickets = supportTickets.filter(function(t) {
     return t.userId === userId;
+    return t.ownerVersion === 2 && t.userId === userId;
   });
   res.json({ tickets: userTickets });
 });
