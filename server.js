@@ -38,7 +38,11 @@ setInterval(function() {
 }, 5 * 60 * 1000);
 
 app.use(express.json({ limit: '50mb' }));
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'Accept'] }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Support-Identity', 'X-Admin-Key']
+}));
 app.options('*', function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
