@@ -52,14 +52,9 @@ app.options('*', function(req, res) {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'ui.html')));
 
-// Lightweight healthcheck target — if Railway's Healthcheck Path is set to
-// something that doesn't exist (or to '/', which does a full file read of
-// ui.html), a failing/slow check can cause Railway to kill and restart the
-// container in a loop even though the app is otherwise fine. Point Railway's
-// Healthcheck Path (Settings → Deploy → Healthcheck Path) at '/health'.
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// ─── PRIVACY POLICY & TERMS (public, required for Atlassian/Figma listings) ──
+// ─── PRIVACY POLICY & TERMS ──────────────────────────────────────────────────
 app.get('/privacy', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html lang="en">
@@ -161,27 +156,13 @@ const GITLAB_CLIENT_ID     = process.env.GITLAB_CLIENT_ID;
 const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET;
 const BASE_URL             = process.env.BASE_URL || 'https://jira-proxy-production-ec4e.up.railway.app';
 const ADMIN_KEY            = process.env.ADMIN_KEY || 'dev-key-123';
-// Used only to sign the private support-ticket identity returned during the
-// OAuth handoff. Prefer a dedicated SUPPORT_IDENTITY_SECRET in production;
-// the OAuth client secret is a stable server-only fallback for existing setups.
 const SUPPORT_IDENTITY_SECRET = process.env.SUPPORT_IDENTITY_SECRET || JIRA_CLIENT_SECRET || GITLAB_CLIENT_SECRET;
 
 // ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 var pendingCodes  = {};
 var pendingStates = {};
 
-// ─── PERSISTED STORE: SUPPORT TICKETS ────────────────────────────────────────
-// These used to live only in a RAM array, so every redeploy (new Node process)
-// wiped all tickets. We now load them from disk on boot and save after every
-// write, so a deploy no longer destroys user data.
-//
-// IMPORTANT: this only survives redeploys if DATA_DIR points at a persistent
-// disk/volume. On platforms with an ephemeral filesystem (e.g. Railway without
-// a Volume attached), the file itself gets wiped on deploy just like RAM did.
-// In Railway: Project → Service → Settings → Volumes → add a volume mounted at
-// the path you set DATA_DIR to (e.g. /data), then set env var DATA_DIR=/data.
-// For a more robust/scalable long-term fix, migrate this to a real database
-// (Railway Postgres, etc.) instead of a JSON file.
+// ─── PERSISTED STORE: SUPPORT TICKETS ──────────────────────────────────────
 const fs = require('fs');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const TICKETS_FILE = path.join(DATA_DIR, 'tickets.json');
@@ -225,17 +206,22 @@ setInterval(function() {
 }, 60000);
 
 // ─── SUPPORT TICKETS ──────────────────────────────────────────────────────────
-function createSupportIdentity(provider, userId) {
-  if (!SUPPORT_IDENTITY_SECRET || !userId) return null;
-  var payload = provider + ':' + String(userId);
+function getTicketOwnerKey(provider, userId, email) {
+  var normalizedEmail = String(email || '').trim().toLowerCase();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return 'email-' + crypto.createHash('sha256').update('support-owner:' + normalizedEmail).digest('hex');
+  }
+  return provider + '-' + String(userId || '');
+}
+
+function createSupportIdentity(ownerKey) {
+  if (!SUPPORT_IDENTITY_SECRET || !ownerKey) return null;
+  var payload = 'v2|' + ownerKey;
   var signature = crypto.createHmac('sha256', SUPPORT_IDENTITY_SECRET).update(payload).digest('hex');
   return payload + '.' + signature;
 }
 
 function getOAuthSubject(accessToken) {
-  // Atlassian OAuth access tokens normally carry the stable account id in
-  // their JWT `sub` claim. This is a fallback only when /myself is unavailable
-  // for a particular Jira site during the login handoff.
   try {
     var parts = String(accessToken || '').split('.');
     if (parts.length !== 3) return null;
@@ -246,8 +232,6 @@ function getOAuthSubject(accessToken) {
   }
 }
 
-// The browser never chooses an owner id. The server verifies this signed value,
-// which was issued only after the user completed Jira/GitLab OAuth.
 function authenticateSupportUser(req) {
   var identity = String(req.headers['x-support-identity'] || '');
   var separator = identity.lastIndexOf('.');
@@ -259,11 +243,10 @@ function authenticateSupportUser(req) {
       !crypto.timingSafeEqual(Buffer.from(suppliedSignature), Buffer.from(expectedSignature))) {
     throw new Error('Invalid support identity');
   }
-  var firstColon = payload.indexOf(':');
-  var provider = payload.slice(0, firstColon);
-  var userId = payload.slice(firstColon + 1);
-  if ((provider !== 'jira' && provider !== 'gitlab') || !userId) throw new Error('Invalid support identity');
-  return provider + '-' + userId;
+  if (!/^v2\|(email-[a-f0-9]{64}|(?:jira|gitlab)-.+)$/.test(payload)) {
+    throw new Error('Invalid support identity');
+  }
+  return payload.slice(3);
 }
 
 function supportAuthError(res, error) {
@@ -287,10 +270,7 @@ app.post('/api/support/tickets', async function(req, res) {
     message: message.substring(0, 5000),
     email: email || 'anonymous',
     userId: ownerId,
-    // Records created before the signed-identity implementation cannot be
-    // safely attributed after the fact. Version new records explicitly so
-    // only verifiably private tickets ever appear in a user's ticket list.
-    ownerVersion: 3,
+    ownerVersion: 4,
     priority: priority || 'medium',
     status: 'new',
     createdAt: new Date().toISOString(),
@@ -312,7 +292,7 @@ app.get('/api/support/tickets', async function(req, res) {
   try { userId = authenticateSupportUser(req); }
   catch (error) { return supportAuthError(res, error); }
   var userTickets = supportTickets.filter(function(t) {
-    return t.ownerVersion === 3 && t.userId === userId;
+    return t.ownerVersion === 4 && t.userId === userId;
   });
   res.json({ tickets: userTickets });
 });
@@ -344,12 +324,8 @@ app.post('/api/support/tickets/:id/reply', express.json(), function(req, res) {
   ticket.updatedAt = new Date().toISOString();
   if (isAdmin) {
     if (status && VALID_STATUSES.indexOf(status) !== -1) {
-      // Explicit status change from Resolve/Close buttons — always respect it.
       ticket.status = status;
     } else if (ticket.status === 'new') {
-      // Plain reply with no explicit status: just bump a fresh ticket to
-      // in_progress. Don't clobber an already resolved/closed ticket just
-      // because the admin sent a follow-up note.
       ticket.status = 'in_progress';
     }
   }
@@ -891,17 +867,76 @@ function generateCode(data) {
 }
 
 function successPage(code, service) {
-  return '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Structify</title>' +
-    '<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0a0f;color:#f0f0f5;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#111118;border:1px solid rgba(255,255,255,0.07);border-radius:24px;padding:40px 36px;text-align:center;max-width:380px;width:90%}.check-wrap{width:64px;height:64px;background:rgba(24,212,167,0.12);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;border:1.5px solid rgba(24,212,167,0.25)}.check-wrap svg{width:28px;height:28px}h1{font-size:20px;font-weight:700;margin-bottom:6px}.sub{font-size:12px;color:#6b6b80;margin-bottom:24px;line-height:1.6}.code-box{background:#0c1f1a;border:1.5px solid rgba(24,212,167,0.35);border-radius:16px;padding:18px 20px;margin-bottom:20px}.code-label{font-size:10px;color:#6b6b80;text-transform:uppercase;letter-spacing:0.12em;margin-bottom:10px}.code{font-size:44px;font-weight:800;letter-spacing:0.22em;color:#18D4A7;font-family:ui-monospace,monospace}.timer-row{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:4px}.timer-label{font-size:11px;color:#3a3a4a}.timer-val{font-size:11px;font-weight:700;color:#18D4A7;min-width:34px}</style>' +
-    '<script>try{if(window.history&&window.history.replaceState){window.history.replaceState({},"Structify","/?connected=1");}}catch(e){}<\/script>' +
-    '</head><body><div class="card">' +
-    '<div class="check-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="#18D4A7" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>' +
-    '<h1>Connected to ' + service + '!</h1>' +
-    '<p class="sub">Enter this code in Structify<br>to complete the connection.</p>' +
-    '<div class="code-box"><div class="code-label">Your Plugin Code</div><div class="code">' + code + '</div>' +
-    '<div class="timer-row"><span class="timer-label">Expires in</span><span class="timer-val" id="exp">5:00</span></div></div></div>' +
-    '<script>(function(){var exp=300;var el=document.getElementById("exp");var t=setInterval(function(){exp--;if(exp<=0){clearInterval(t);el.textContent="0:00";return;}var m=Math.floor(exp/60),s=exp%60;el.textContent=m+":"+(s<10?"0":"")+s;},1000);})();<\/script>' +
-    '</body></html>';
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Structify - Connected to ${service}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px 36px; text-align: center; max-width: 400px; width: 90%; }
+    .check-wrap { width: 64px; height: 64px; background: rgba(24,212,167,0.12); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; border: 1.5px solid rgba(24,212,167,0.25); }
+    .check-wrap svg { width: 28px; height: 28px; }
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+    .sub { font-size: 12px; color: #6b6b80; margin-bottom: 24px; line-height: 1.6; }
+    .code-box { background: #0c1f1a; border: 1.5px solid rgba(24,212,167,0.35); border-radius: 16px; padding: 18px 20px; margin-bottom: 20px; }
+    .code-label { font-size: 10px; color: #6b6b80; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 10px; }
+    .code { font-size: 44px; font-weight: 800; letter-spacing: 0.22em; color: #18D4A7; font-family: ui-monospace, monospace; user-select: all; }
+    .timer-row { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 4px; }
+    .timer-label { font-size: 11px; color: #3a3a4a; }
+    .timer-val { font-size: 11px; font-weight: 700; color: #18D4A7; min-width: 34px; }
+    .back-link { display: inline-block; margin-top: 16px; color: #6b6b80; font-size: 12px; text-decoration: none; }
+    .back-link:hover { color: #18D4A7; }
+    .tip { font-size: 11px; color: #3a3a4a; margin-top: 12px; padding: 12px; background: rgba(24,212,167,0.04); border-radius: 8px; border: 1px solid rgba(24,212,167,0.06); }
+    .tip strong { color: #18D4A7; }
+  </style>
+  <script>
+    try {
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState({}, "Structify", "/?connected=1");
+      }
+    } catch(e) {}
+  </script>
+</head>
+<body>
+  <div class="card">
+    <div class="check-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#18D4A7" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+    </div>
+    <h1>Connected to ${service}!</h1>
+    <p class="sub">Enter this code in Structify<br>to complete the connection.</p>
+    <div class="code-box">
+      <div class="code-label">Your Plugin Code</div>
+      <div class="code">${code}</div>
+      <div class="timer-row">
+        <span class="timer-label">Expires in</span>
+        <span class="timer-val" id="exp">5:00</span>
+      </div>
+    </div>
+    <p class="tip">💡 <strong>Tip:</strong> If you have multiple Jira sites, make sure the Structify app is installed on each one you want to use.</p>
+    <a href="${BASE_URL}" class="back-link">← Back to login</a>
+  </div>
+  <script>
+    (function() {
+      var exp = 300;
+      var el = document.getElementById("exp");
+      var t = setInterval(function() {
+        exp--;
+        if (exp <= 0) {
+          clearInterval(t);
+          el.textContent = "0:00";
+          return;
+        }
+        var m = Math.floor(exp / 60), s = exp % 60;
+        el.textContent = m + ":" + (s < 10 ? "0" : "") + s;
+      }, 1000);
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 function httpsRequest(options, body) {
@@ -932,45 +967,195 @@ function httpsRequest(options, body) {
 app.get('/auth/jira', rateLimiter(10), async function(req, res) {
   var state = crypto.randomBytes(16).toString('hex');
   pendingStates[state] = { provider: 'jira', createdAt: Date.now() };
+  
+  // CRITICAL FIX: Request access to ALL accessible resources, not just one site
+  // The user needs to authorize the app at the org/account level, not per-site
   var url = 'https://auth.atlassian.com/authorize' +
     '?audience=api.atlassian.com' +
     '&client_id=' + JIRA_CLIENT_ID +
-    '&scope=' + encodeURIComponent('read:jira-work write:jira-work read:jira-user offline_access') +
+    '&scope=' + encodeURIComponent(
+      'read:jira-work write:jira-work read:jira-user read:me offline_access ' +
+      'read:jira-work:jira-software read:jira-work:jira-core'
+    ) +
     '&redirect_uri=' + encodeURIComponent(BASE_URL + '/auth/jira/callback') +
-    '&state=' + state + '&response_type=code';
+    '&state=' + state + 
+    '&response_type=code' +
+    '&prompt=consent';
+  
+  console.log('[AUTH] Jira OAuth URL generated with state:', state);
   res.redirect(url);
 });
 
 app.get('/auth/jira/callback', async function(req, res) {
   var code = req.query.code, state = req.query.state;
-  if (!code) return res.status(400).send('<h2>Error: No code</h2>');
-  if (!state || !pendingStates[state] || pendingStates[state].provider !== 'jira')
-    return res.status(403).send('<h2>Error: Invalid or expired state.</h2>');
+  if (!code) {
+    console.error('[AUTH] Jira callback: No code provided');
+    return res.status(400).send('<h2>Error: No authorization code received</h2><p>Please try again.</p>');
+  }
+  
+  if (!state || !pendingStates[state] || pendingStates[state].provider !== 'jira') {
+    console.error('[AUTH] Jira callback: Invalid or expired state:', state);
+    return res.status(403).send('<h2>Error: Invalid or expired state.</h2><p>Please go back and try again.</p>');
+  }
+  
   delete pendingStates[state];
+  
   try {
-    var body = JSON.stringify({ grant_type: 'authorization_code', client_id: JIRA_CLIENT_ID, client_secret: JIRA_CLIENT_SECRET, code: code, redirect_uri: BASE_URL + '/auth/jira/callback' });
-    var tokenRes = await httpsRequest({ hostname: 'auth.atlassian.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, body);
-    if (!tokenRes.data.access_token) return res.status(400).send('<h2>Token error</h2>');
-    var resourcesRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/oauth/token/accessible-resources', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-    var cloudId = resourcesRes.data[0] ? resourcesRes.data[0].id  : null;
-    var jiraUrl = resourcesRes.data[0] ? resourcesRes.data[0].url : null;
-    // Fetch the actual signed-in Jira account's identity (accountId is stable
-    // and unique per Atlassian account) so tickets/usage can be scoped to the
-    // real connected account rather than just the Jira site.
+    // Exchange code for token
+    var body = JSON.stringify({ 
+      grant_type: 'authorization_code', 
+      client_id: JIRA_CLIENT_ID, 
+      client_secret: JIRA_CLIENT_SECRET, 
+      code: code, 
+      redirect_uri: BASE_URL + '/auth/jira/callback' 
+    });
+    
+    var tokenRes = await httpsRequest({ 
+      hostname: 'auth.atlassian.com', 
+      path: '/oauth/token', 
+      method: 'POST', 
+      headers: { 
+        'Content-Type': 'application/json', 
+        'Content-Length': Buffer.byteLength(body) 
+      } 
+    }, body);
+    
+    if (!tokenRes.data.access_token) {
+      console.error('[AUTH] Jira token error:', tokenRes.data);
+      return res.status(400).send('<h2>Token error</h2><p>' + JSON.stringify(tokenRes.data) + '</p>');
+    }
+    
+    console.log('[AUTH] Jira token obtained successfully');
+    
+    // Get accessible resources (sites the user has access to)
+    var resourcesRes = await httpsRequest({ 
+      hostname: 'api.atlassian.com', 
+      path: '/oauth/token/accessible-resources', 
+      method: 'GET', 
+      headers: { 
+        'Authorization': 'Bearer ' + tokenRes.data.access_token, 
+        'Accept': 'application/json' 
+      } 
+    });
+    
+    console.log('[AUTH] Jira accessible resources count:', resourcesRes.data ? resourcesRes.data.length : 0);
+    
+    // Get the first accessible resource (primary site)
+    var cloudId = resourcesRes.data && resourcesRes.data.length > 0 ? resourcesRes.data[0].id : null;
+    var jiraUrl = resourcesRes.data && resourcesRes.data.length > 0 ? resourcesRes.data[0].url : null;
+    
+    // If no accessible resources, return error with helpful message
+    if (!cloudId) {
+      console.error('[AUTH] No accessible Jira resources found');
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Access Denied</title>
+        <style>
+          body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+          .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
+          h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
+          p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
+          .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+          .btn:hover { opacity: 0.85; }
+        </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>⚠️ No Jira Sites Found</h1>
+            <p>You don't have access to any Jira sites, or the Structify app hasn't been installed on your Jira site.</p>
+            <p style="font-size:12px;color:#3a3a4a;margin-top:8px">Make sure you have a Jira site and the Structify app is installed on it.</p>
+            <a href="${BASE_URL}" class="btn">Try Again</a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+    
+    // Fetch the actual signed-in Jira account's identity
     var jiraAccountId = null, jiraEmail = null;
+    try {
+      var identityRes = await httpsRequest({ 
+        hostname: 'api.atlassian.com', 
+        path: '/me', 
+        method: 'GET', 
+        headers: { 
+          'Authorization': 'Bearer ' + tokenRes.data.access_token, 
+          'Accept': 'application/json' 
+        } 
+      });
+      jiraAccountId = identityRes.data && (identityRes.data.account_id || identityRes.data.accountId) || null;
+      jiraEmail = identityRes.data && identityRes.data.email || null;
+      console.log('[AUTH] Jira user identity:', jiraAccountId);
+    } catch (identityErr) {
+      console.error('[AUTH] Failed to fetch /me:', identityErr.message);
+    }
+    
+    // Also try to get the user from the specific cloud site
     if (cloudId) {
       try {
-        var meRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/myself', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-        jiraAccountId = meRes.data && meRes.data.accountId ? meRes.data.accountId : null;
-        jiraEmail = meRes.data && meRes.data.emailAddress ? meRes.data.emailAddress : null;
+        var meRes = await httpsRequest({ 
+          hostname: 'api.atlassian.com', 
+          path: '/ex/jira/' + cloudId + '/rest/api/3/myself', 
+          method: 'GET', 
+          headers: { 
+            'Authorization': 'Bearer ' + tokenRes.data.access_token, 
+            'Accept': 'application/json' 
+          } 
+        });
+        if (meRes.data && meRes.data.accountId) jiraAccountId = meRes.data.accountId;
+        if (meRes.data && meRes.data.emailAddress) jiraEmail = meRes.data.emailAddress;
+        console.log('[AUTH] Jira user from site:', jiraAccountId);
       } catch (meErr) {
-        console.error('[JIRA] Failed to fetch /myself:', meErr.message);
+        console.error('[AUTH] Failed to fetch /myself:', meErr.message);
       }
     }
-    if (!jiraAccountId) jiraAccountId = getOAuthSubject(tokenRes.data.access_token);
-    var pluginCode = generateCode({ provider: 'jira', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, cloudId: cloudId, jiraUrl: jiraUrl, userId: jiraAccountId, email: jiraEmail, supportIdentity: createSupportIdentity('jira', jiraAccountId) });
+    
+    // Fallback to OAuth subject claim
+    if (!jiraAccountId) {
+      jiraAccountId = getOAuthSubject(tokenRes.data.access_token);
+    }
+    
+    // Generate the plugin code
+    var pluginCode = generateCode({ 
+      provider: 'jira', 
+      accessToken: tokenRes.data.access_token, 
+      refreshToken: tokenRes.data.refresh_token, 
+      cloudId: cloudId, 
+      jiraUrl: jiraUrl, 
+      userId: jiraAccountId, 
+      email: jiraEmail, 
+      supportIdentity: createSupportIdentity(getTicketOwnerKey('jira', jiraAccountId, jiraEmail)) 
+    });
+    
+    console.log('[AUTH] Jira login successful for user:', jiraAccountId);
     res.send(successPage(pluginCode, 'Jira'));
-  } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
+    
+  } catch(e) { 
+    console.error('[AUTH] Jira callback error:', e.message, e.stack);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Error</title>
+      <style>
+        body { font-family: -apple-system, sans-serif; background: #0a0a0f; color: #f0f0f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .card { background: #111118; border: 1px solid rgba(255,255,255,0.07); border-radius: 24px; padding: 40px; max-width: 480px; width: 90%; text-align: center; }
+        h1 { color: #ff7a90; font-size: 24px; margin-bottom: 12px; }
+        p { color: #6b6b80; line-height: 1.6; font-size: 14px; }
+        .btn { display: inline-block; margin-top: 20px; padding: 12px 24px; background: #18D4A7; color: #07101F; text-decoration: none; border-radius: 8px; font-weight: 600; }
+        .btn:hover { opacity: 0.85; }
+      </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>❌ Something Went Wrong</h1>
+          <p>${e.message || 'Unknown error'}</p>
+          <a href="${BASE_URL}" class="btn">Try Again</a>
+        </div>
+      </body>
+      </html>
+    `);
+  }
 });
 
 // ─── GITLAB AUTH ─────────────────────────────────────────────────────────────
@@ -999,7 +1184,7 @@ app.get('/auth/gitlab/callback', async function(req, res) {
     var tokenRes = await httpsRequest({ hostname: 'gitlab.com', path: '/oauth/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, body);
     if (!tokenRes.data.access_token) return res.status(400).send('<h2>GitLab token error</h2>');
     var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + tokenRes.data.access_token, 'Accept': 'application/json' } });
-  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id, supportIdentity: createSupportIdentity('gitlab', userRes.data.id) });
+  var pluginCode = generateCode({ provider: 'gitlab', accessToken: tokenRes.data.access_token, refreshToken: tokenRes.data.refresh_token, username: userRes.data.username, name: userRes.data.name, userId: userRes.data.id, email: userRes.data.email || null, supportIdentity: createSupportIdentity(getTicketOwnerKey('gitlab', userRes.data.id, userRes.data.email)) });
     res.send(successPage(pluginCode, 'GitLab'));
   } catch(e) { res.status(500).send('<h2>Error: ' + e.message + '</h2>'); }
 });
@@ -1071,25 +1256,27 @@ app.post('/spaces', async function(req, res) {
   
   try {
     if (provider === 'gitlab') {
-      // GitLab also needs pagination
       var userRes = await httpsRequest({ 
         hostname: 'gitlab.com', 
         path: '/api/v4/user', 
         method: 'GET', 
         headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
       });
+      
       if (userRes.status !== 200 || !userRes.data.id) {
         return res.status(userRes.status || 401).json({ error: 'Could not fetch GitLab user profile' });
       }
+      
       var userId = userRes.data.id;
       
-      // --- GitLab pagination loop ---
+      // --- GitLab pagination ---
       var allProjects = [];
       var page = 1;
       var perPage = 50;
       var hasMore = true;
+      var maxPages = 50;
       
-      while (hasMore) {
+      while (hasMore && page <= maxPages) {
         var glRes = await httpsRequest({ 
           hostname: 'gitlab.com', 
           path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=' + perPage + '&page=' + page,
@@ -1106,18 +1293,21 @@ app.post('/spaces', async function(req, res) {
           else page++;
         }
       }
+      
       return res.json({ spaces: allProjects.map(function(p) { 
         return { id: String(p.id), name: p.name, webUrl: p.web_url || '' }; 
       }) });
     }
     
-    // --- Jira pagination loop ---
+    // --- Jira pagination ---
     var allProjects = [];
     var startAt = 0;
     var maxResults = 50;
     var hasMore = true;
+    var maxPages = 50;
+    var pageCount = 0;
     
-    while (hasMore) {
+    while (hasMore && pageCount < maxPages) {
       var jiraRes = await httpsRequest({ 
         hostname: 'api.atlassian.com', 
         path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=' + maxResults + '&startAt=' + startAt,
@@ -1130,15 +1320,16 @@ app.post('/spaces', async function(req, res) {
       var data = jiraRes.data;
       var projects = data.values || [];
       allProjects = allProjects.concat(projects);
+      pageCount++;
       
-      // Check if we've fetched all
-      if (allProjects.length >= data.total || projects.length < maxResults) {
+      if (allProjects.length >= (data.total || 0) || projects.length < maxResults) {
         hasMore = false;
       } else {
         startAt += maxResults;
       }
     }
     
+    console.log('[SPACES] Loaded ' + allProjects.length + ' projects from Jira');
     res.json({ spaces: allProjects.map(function(p) { 
       return { id: p.key, name: p.name }; 
     }) });
@@ -1156,25 +1347,32 @@ app.post('/tickets', async function(req, res) {
   try {
     if (provider === 'gitlab') {
       var projectId = req.body.spaceId;
+      console.log('[TICKETS] GitLab projectId:', projectId);
+      
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
       
-      // --- GitLab pagination loop ---
+      // --- GitLab pagination ---
       var allIssues = [];
       var page = 1;
       var perPage = 50;
       var hasMore = true;
+      var maxPages = 50;
       
-      while (hasMore) {
+      while (hasMore && page <= maxPages) {
         var glRes = await httpsRequest({ 
           hostname: 'gitlab.com', 
           path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=' + perPage + '&page=' + page,
           method: 'GET', 
           headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
         });
+        
+        console.log('[TICKETS] GitLab response status:', glRes.status, 'page:', page);
+        
         if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
-          console.error('[TICKETS] GitLab error:', glRes.status);
+          console.error('[TICKETS] GitLab error:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
           return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
         }
+        
         var issues = glRes.data;
         if (issues.length === 0) {
           hasMore = false;
@@ -1184,6 +1382,8 @@ app.post('/tickets', async function(req, res) {
           else page++;
         }
       }
+      
+      console.log('[TICKETS] Loaded ' + allIssues.length + ' issues from GitLab');
       
       return res.json({ tickets: allIssues.map(function(issue) {
         return {
@@ -1203,17 +1403,21 @@ app.post('/tickets', async function(req, res) {
       }) });
     }
     
-    // --- Jira pagination loop ---
+    // --- Jira pagination ---
     var spaceId = req.body.spaceId;
     var allIssues = [];
     var startAt = 0;
     var maxResults = 50;
     var hasMore = true;
+    var maxPages = 50;
+    var pageCount = 0;
     var baseJql = spaceId 
       ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' 
       : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
     
-    while (hasMore) {
+    console.log('[TICKETS] Jira jql:', decodeURIComponent(baseJql));
+    
+    while (hasMore && pageCount < maxPages) {
       var jiraRes = await httpsRequest({ 
         hostname: 'api.atlassian.com', 
         path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + baseJql + '&maxResults=' + maxResults + '&startAt=' + startAt + '&fields=summary,description,status,priority,assignee,reporter,issuetype,created',
@@ -1227,14 +1431,16 @@ app.post('/tickets', async function(req, res) {
       
       var issues = jiraRes.data.issues;
       allIssues = allIssues.concat(issues);
+      pageCount++;
       
-      // Check if we've fetched all
       if (allIssues.length >= (jiraRes.data.total || 0) || issues.length < maxResults) {
         hasMore = false;
       } else {
         startAt += maxResults;
       }
     }
+    
+    console.log('[TICKETS] Loaded ' + allIssues.length + ' issues from Jira');
     
     var tickets = allIssues.map(function(issue) {
       var desc = 'No description';
@@ -1641,9 +1847,6 @@ app.post('/comment', async function(req, res) {
 });
 
 // ─── START ───────────────────────────────────────────────────────────────────
-// Log SIGTERM explicitly so the next restart-loop shows *when* Railway is
-// asking the process to stop, which helps distinguish "platform killed us"
-// (healthcheck/OOM) from an actual in-app crash.
 process.on('SIGTERM', function() {
   console.log('[SHUTDOWN] Received SIGTERM, exiting.');
   process.exit(0);
