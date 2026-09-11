@@ -1064,32 +1064,75 @@ app.post('/auth/gitlab/refresh', async function(req, res) {
 });
 
 // ─── SPACES ──────────────────────────────────────────────────────────────────
+// ─── SPACES ──────────────────────────────────────────────────────────────────
+// Fetch ALL projects/spaces by following pagination, not just the first page.
 app.post('/spaces', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
   if (!accessToken) return res.status(401).json({ error: 'No access token provided' });
-  
+
   try {
     if (provider === 'gitlab') {
-      var userRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/user', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-      
-      if (userRes.status !== 200 || !userRes.data.id) {
-         return res.status(userRes.status || 401).json({ error: 'Could not fetch GitLab user profile' });
+      // GitLab: paginate /projects (membership=true returns only projects
+      // the user is a member of). Use per_page=100 (max) and follow
+      // X-Next-Page until empty. Cap at 10 pages = 1000 projects to keep
+      // the plugin responsive even for large orgs.
+      var allProjects = [];
+      var page = 1;
+      var maxPages = 10;
+      while (page <= maxPages) {
+        var glRes = await httpsRequest({
+          hostname: 'gitlab.com',
+          path: '/api/v4/projects?membership=true&simple=true&per_page=100&page=' + page + '&order_by=last_activity_at',
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+        });
+        if (glRes.status !== 200 || !Array.isArray(glRes.data) || glRes.data.length === 0) break;
+        allProjects = allProjects.concat(glRes.data);
+        if (glRes.data.length < 100) break; // last page
+        page++;
       }
-      
-      var userId = userRes.data.id;
-      
-      var glRes = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/users/' + userId + '/projects?simple=true&per_page=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-      
-      return res.json({ spaces: (glRes.data || []).map(function(p) { return { id: String(p.id), name: p.name, webUrl: p.web_url || '' }; }) });
+      console.log('[SPACES] GitLab: fetched ' + allProjects.length + ' projects across ' + page + ' page(s)');
+      return res.json({
+        spaces: allProjects.map(function(p) {
+          return { id: String(p.id), name: p.name, webUrl: p.web_url || '' };
+        })
+      });
     }
-    
-    var jiraRes = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?maxResults=50', method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } });
-    res.json({ spaces: (jiraRes.data.values || []).map(function(p) { return { id: p.key, name: p.name }; }) });
-  } catch(e) { console.error('[SPACES] Exception:', e.stack || e.message); res.status(500).json({ error: e.message }); }
-});
 
+    // Jira: paginate /project/search. The response has `total`, `maxResults`,
+    // `startAt`, and `isLast`. Loop until isLast is true or startAt >= total.
+    var allJiraProjects = [];
+    var startAt = 0;
+    var maxResults = 50;
+    var maxLoops = 20; // safety cap = 1000 projects
+    for (var i = 0; i < maxLoops; i++) {
+      var jiraRes = await httpsRequest({
+        hostname: 'api.atlassian.com',
+        path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?startAt=' + startAt + '&maxResults=' + maxResults,
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+      });
+      if (jiraRes.status !== 200 || !jiraRes.data || !jiraRes.data.values) break;
+      allJiraProjects = allJiraProjects.concat(jiraRes.data.values);
+      if (jiraRes.data.isLast || jiraRes.data.values.length === 0) break;
+      startAt += maxResults;
+      if (typeof jiraRes.data.total === 'number' && startAt >= jiraRes.data.total) break;
+    }
+    console.log('[SPACES] Jira: fetched ' + allJiraProjects.length + ' projects');
+    res.json({
+      spaces: allJiraProjects.map(function(p) {
+        return { id: p.key, name: p.name };
+      })
+    });
+  } catch(e) {
+    console.error('[SPACES] Exception:', e.stack || e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 // ─── TICKETS ─────────────────────────────────────────────────────────────────
+// ─── TICKETS ─────────────────────────────────────────────────────────────────
+// Fetch ALL issues (not just the first page) for the selected project/space.
 app.post('/tickets', async function(req, res) {
   res.header('Access-Control-Allow-Origin', '*');
   var accessToken = req.body.accessToken, cloudId = req.body.cloudId, provider = req.body.provider || 'jira';
@@ -1097,25 +1140,27 @@ app.post('/tickets', async function(req, res) {
   try {
     if (provider === 'gitlab') {
       var projectId = req.body.spaceId;
-      console.log('[TICKETS] GitLab projectId:', projectId);
-      
       if (!projectId) return res.status(400).json({ error: 'spaceId required for GitLab' });
-      
-      var glRes = await httpsRequest({ 
-        hostname: 'gitlab.com', 
-        path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=50', 
-        method: 'GET', 
-        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
-      });
-      
-      console.log('[TICKETS] GitLab response status:', glRes.status);
-      
-      if (glRes.status !== 200 || !Array.isArray(glRes.data)) {
-        console.error('[TICKETS] GitLab error:', glRes.status, JSON.stringify(glRes.data).slice(0, 500));
-        return res.status(glRes.status || 500).json({ error: 'GitLab error', detail: glRes.data });
+
+      // GitLab: paginate /issues with per_page=100.
+      var allIssues = [];
+      var page = 1;
+      var maxPages = 10; // cap at 1000 issues
+      while (page <= maxPages) {
+        var glRes = await httpsRequest({
+          hostname: 'gitlab.com',
+          path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues?per_page=100&page=' + page + '&order_by=updated_at&sort=desc',
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+        });
+        if (glRes.status !== 200 || !Array.isArray(glRes.data) || glRes.data.length === 0) break;
+        allIssues = allIssues.concat(glRes.data);
+        if (glRes.data.length < 100) break;
+        page++;
       }
-      
-      var tickets = glRes.data.map(function(issue) {
+      console.log('[TICKETS] GitLab: fetched ' + allIssues.length + ' issues across ' + page + ' page(s)');
+
+      var glTickets = allIssues.map(function(issue) {
         return {
           id: issue.iid,
           title: issue.title,
@@ -1131,33 +1176,68 @@ app.post('/tickets', async function(req, res) {
           issueType: issue.issue_type || 'issue'
         };
       });
-      
-      return res.json({ tickets: tickets });
+      return res.json({ tickets: glTickets });
     }
-    
+
+    // Jira: paginate the search/jql endpoint. Atlassian caps maxResults at 100
+    // for this endpoint, so loop until isLast or a safety cap.
     var spaceId = req.body.spaceId;
-    var jql = spaceId ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC' : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
-    var jiraRes = await httpsRequest({ 
-      hostname: 'api.atlassian.com', 
-      path: '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql + '&maxResults=30&fields=summary,description,status,priority,assignee,reporter,issuetype,created', 
-      method: 'GET', 
-      headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' } 
-    });
-    
-    if (!jiraRes.data.issues) return res.status(500).json({ error: 'No issues', raw: jiraRes.data });
-    
-    var tickets = jiraRes.data.issues.map(function(issue) {
+    var jql = spaceId
+      ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC'
+      : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
+
+    var allJiraIssues = [];
+    var nextPageToken = null;
+    var maxLoops = 10; // cap at ~1000 issues
+    for (var i = 0; i < maxLoops; i++) {
+      var path = '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql +
+                 '&maxResults=100&fields=summary,description,status,priority,assignee,reporter,issuetype,created';
+      if (nextPageToken) path += '&nextPageToken=' + encodeURIComponent(nextPageToken);
+
+      var jiraRes = await httpsRequest({
+        hostname: 'api.atlassian.com',
+        path: path,
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+      });
+
+      if (jiraRes.status !== 200 || !jiraRes.data || !jiraRes.data.issues) break;
+      allJiraIssues = allJiraIssues.concat(jiraRes.data.issues);
+
+      // Jira's new /search/jql endpoint returns either `isLast` or a
+      // `nextPageToken`. Handle both.
+      if (jiraRes.data.isLast) break;
+      if (jiraRes.data.nextPageToken) {
+        nextPageToken = jiraRes.data.nextPageToken;
+      } else {
+        break; // no more pages
+      }
+      if (jiraRes.data.issues.length === 0) break;
+    }
+    console.log('[TICKETS] Jira: fetched ' + allJiraIssues.length + ' issues');
+
+    var jiraTickets = allJiraIssues.map(function(issue) {
       var desc = 'No description';
-      try { 
+      try {
         if (issue.fields.description && issue.fields.description.content) {
-          desc = issue.fields.description.content[0].content[0].text; 
+          // Walk ADF paragraphs to grab real text
+          var paragraphs = issue.fields.description.content || [];
+          var parts = [];
+          paragraphs.forEach(function(p) {
+            if (p.content) {
+              p.content.forEach(function(inline) {
+                if (inline.text) parts.push(inline.text);
+              });
+            }
+          });
+          if (parts.length) desc = parts.join(' ').slice(0, 2000);
         }
       } catch(e) {}
-      
-      return { 
-        id: issue.key, 
-        title: issue.fields.summary, 
-        description: desc, 
+
+      return {
+        id: issue.key,
+        title: issue.fields.summary,
+        description: desc,
         priority: (issue.fields.priority && issue.fields.priority.name) || '',
         status: issue.fields.status ? issue.fields.status.name : '',
         assignee: issue.fields.assignee ? issue.fields.assignee.displayName : 'Unassigned',
@@ -1166,11 +1246,11 @@ app.post('/tickets', async function(req, res) {
         created: issue.fields.created ? new Date(issue.fields.created).toLocaleDateString() : ''
       };
     });
-    
-    res.json({ tickets: tickets });
-  } catch(e) { 
-    console.error('[TICKETS] Exception:', e.stack || e.message); 
-    res.status(500).json({ error: e.message }); 
+
+    res.json({ tickets: jiraTickets });
+  } catch(e) {
+    console.error('[TICKETS] Exception:', e.stack || e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
