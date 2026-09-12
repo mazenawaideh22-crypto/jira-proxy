@@ -904,6 +904,41 @@ function successPage(code, service) {
     '</body></html>';
 }
 
+// Resolve every Jira site (cloud) the current access token can see, fresh,
+// on every call. We deliberately do NOT rely on a cloudId cached at login
+// time: a user may have had zero accessible sites when they first connected
+// (e.g. no site of their own yet, invite to a company site not yet active,
+// etc.) and gained access to one or more sites later without ever
+// reconnecting the plugin. Re-resolving here means spaces/tickets just show
+// up next time they're loaded, and a user with multiple sites (e.g. a
+// personal site AND a company site) sees projects from all of them instead
+// of only whichever one happened to be first in the list at login.
+async function getAccessibleJiraSites(accessToken) {
+  var resourcesRes = await httpsRequest({
+    hostname: 'api.atlassian.com',
+    path: '/oauth/token/accessible-resources',
+    method: 'GET',
+    headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+  });
+  if (resourcesRes.status !== 200 || !Array.isArray(resourcesRes.data)) return [];
+  return resourcesRes.data.map(function(r) {
+    return { cloudId: r.id, url: r.url, name: r.name || r.url };
+  });
+}
+
+// Composite space ids are "cloudId::projectKey" so a ticket fetch always
+// knows exactly which site a project came from, even when spaces were
+// aggregated from several sites. Falls back gracefully if an older cached
+// spaceId (from before this change) comes in without the delimiter.
+function encodeJiraSpaceId(cloudId, projectKey) {
+  return cloudId + '::' + projectKey;
+}
+function decodeJiraSpaceId(spaceId, fallbackCloudId) {
+  var idx = spaceId.indexOf('::');
+  if (idx === -1) return { cloudId: fallbackCloudId, projectKey: spaceId };
+  return { cloudId: spaceId.slice(0, idx), projectKey: spaceId.slice(idx + 2) };
+}
+
 function httpsRequest(options, body) {
   return new Promise(function(resolve, reject) {
     try {
@@ -1100,31 +1135,48 @@ app.post('/spaces', async function(req, res) {
       });
     }
 
-    // Jira: paginate /project/search. The response has `total`, `maxResults`,
-    // `startAt`, and `isLast`. Loop until isLast is true or startAt >= total.
-    var allJiraProjects = [];
-    var startAt = 0;
-    var maxResults = 50;
-    var maxLoops = 20; // safety cap = 1000 projects
-    for (var i = 0; i < maxLoops; i++) {
-      var jiraRes = await httpsRequest({
-        hostname: 'api.atlassian.com',
-        path: '/ex/jira/' + cloudId + '/rest/api/3/project/search?startAt=' + startAt + '&maxResults=' + maxResults,
-        method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+    // Jira: resolve every accessible site fresh (not the cloudId cached at
+    // login) and paginate /project/search on each one, so a user who had no
+    // site (or fewer sites) when they first connected still sees everything
+    // they currently have access to, without reconnecting.
+    var sites = await getAccessibleJiraSites(accessToken);
+    // Backward-compat: if for some reason no sites resolve (e.g. transient
+    // API hiccup) but the client still has an old cached cloudId, fall back
+    // to just that one rather than showing nothing.
+    if (sites.length === 0 && cloudId) sites = [{ cloudId: cloudId, url: '', name: '' }];
+
+    var allSpaces = [];
+    for (var s = 0; s < sites.length; s++) {
+      var site = sites[s];
+      var siteProjects = [];
+      var startAt = 0;
+      var maxResults = 50;
+      var maxLoops = 20; // safety cap = 1000 projects per site
+      for (var i = 0; i < maxLoops; i++) {
+        var jiraRes = await httpsRequest({
+          hostname: 'api.atlassian.com',
+          path: '/ex/jira/' + site.cloudId + '/rest/api/3/project/search?startAt=' + startAt + '&maxResults=' + maxResults,
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+        });
+        if (jiraRes.status !== 200 || !jiraRes.data || !jiraRes.data.values) break;
+        siteProjects = siteProjects.concat(jiraRes.data.values);
+        if (jiraRes.data.isLast || jiraRes.data.values.length === 0) break;
+        startAt += maxResults;
+        if (typeof jiraRes.data.total === 'number' && startAt >= jiraRes.data.total) break;
+      }
+      // Only disambiguate names with the site when the user actually has
+      // more than one site with projects on it.
+      var needsSitePrefix = sites.length > 1;
+      siteProjects.forEach(function(p) {
+        allSpaces.push({
+          id: encodeJiraSpaceId(site.cloudId, p.key),
+          name: needsSitePrefix ? (site.name + ' / ' + p.name) : p.name
+        });
       });
-      if (jiraRes.status !== 200 || !jiraRes.data || !jiraRes.data.values) break;
-      allJiraProjects = allJiraProjects.concat(jiraRes.data.values);
-      if (jiraRes.data.isLast || jiraRes.data.values.length === 0) break;
-      startAt += maxResults;
-      if (typeof jiraRes.data.total === 'number' && startAt >= jiraRes.data.total) break;
     }
-    console.log('[SPACES] Jira: fetched ' + allJiraProjects.length + ' projects');
-    res.json({
-      spaces: allJiraProjects.map(function(p) {
-        return { id: p.key, name: p.name };
-      })
-    });
+    console.log('[SPACES] Jira: fetched ' + allSpaces.length + ' projects across ' + sites.length + ' site(s)');
+    res.json({ spaces: allSpaces });
   } catch(e) {
     console.error('[SPACES] Exception:', e.stack || e.message);
     res.status(500).json({ error: e.message });
@@ -1181,40 +1233,61 @@ app.post('/tickets', async function(req, res) {
 
     // Jira: paginate the search/jql endpoint. Atlassian caps maxResults at 100
     // for this endpoint, so loop until isLast or a safety cap.
-    var spaceId = req.body.spaceId;
-    var jql = spaceId
-      ? 'project%3D' + encodeURIComponent(spaceId) + '%20ORDER%20BY%20updated%20DESC'
-      : 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC';
+    var rawSpaceId = req.body.spaceId;
+
+    // Figure out which site(s) to query. A selected space carries its own
+    // site (encoded as "cloudId::projectKey" by /spaces), so we always hit
+    // exactly the right site even if the user has several. With no space
+    // selected ("my tickets" mode) we fall back to every accessible site,
+    // since a cached single cloudId is exactly what caused tickets to
+    // silently vanish before.
+    var siteQueries = []; // [{ cloudId, jql }]
+    if (rawSpaceId) {
+      var decoded = decodeJiraSpaceId(rawSpaceId, cloudId);
+      siteQueries.push({
+        cloudId: decoded.cloudId,
+        jql: 'project%3D' + encodeURIComponent(decoded.projectKey) + '%20ORDER%20BY%20updated%20DESC'
+      });
+    } else {
+      var mySites = await getAccessibleJiraSites(accessToken);
+      if (mySites.length === 0 && cloudId) mySites = [{ cloudId: cloudId }];
+      mySites.forEach(function(site) {
+        siteQueries.push({ cloudId: site.cloudId, jql: 'assignee%3DcurrentUser()%20ORDER%20BY%20updated%20DESC' });
+      });
+    }
 
     var allJiraIssues = [];
-    var nextPageToken = null;
-    var maxLoops = 10; // cap at ~1000 issues
-    for (var i = 0; i < maxLoops; i++) {
-      var path = '/ex/jira/' + cloudId + '/rest/api/3/search/jql?jql=' + jql +
-                 '&maxResults=100&fields=summary,description,status,priority,assignee,reporter,issuetype,created';
-      if (nextPageToken) path += '&nextPageToken=' + encodeURIComponent(nextPageToken);
+    var maxLoops = 10; // cap at ~1000 issues per site
+    for (var q = 0; q < siteQueries.length; q++) {
+      var query = siteQueries[q];
+      var nextPageToken = null;
+      for (var i = 0; i < maxLoops; i++) {
+        var path = '/ex/jira/' + query.cloudId + '/rest/api/3/search/jql?jql=' + query.jql +
+                   '&maxResults=100&fields=summary,description,status,priority,assignee,reporter,issuetype,created';
+        if (nextPageToken) path += '&nextPageToken=' + encodeURIComponent(nextPageToken);
 
-      var jiraRes = await httpsRequest({
-        hostname: 'api.atlassian.com',
-        path: path,
-        method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
-      });
+        var jiraRes = await httpsRequest({
+          hostname: 'api.atlassian.com',
+          path: path,
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+        });
 
-      if (jiraRes.status !== 200 || !jiraRes.data || !jiraRes.data.issues) break;
-      allJiraIssues = allJiraIssues.concat(jiraRes.data.issues);
+        if (jiraRes.status !== 200 || !jiraRes.data || !jiraRes.data.issues) break;
+        allJiraIssues = allJiraIssues.concat(jiraRes.data.issues);
 
-      // Jira's new /search/jql endpoint returns either `isLast` or a
-      // `nextPageToken`. Handle both.
-      if (jiraRes.data.isLast) break;
-      if (jiraRes.data.nextPageToken) {
-        nextPageToken = jiraRes.data.nextPageToken;
-      } else {
-        break; // no more pages
+        // Jira's new /search/jql endpoint returns either `isLast` or a
+        // `nextPageToken`. Handle both.
+        if (jiraRes.data.isLast) break;
+        if (jiraRes.data.nextPageToken) {
+          nextPageToken = jiraRes.data.nextPageToken;
+        } else {
+          break; // no more pages
+        }
+        if (jiraRes.data.issues.length === 0) break;
       }
-      if (jiraRes.data.issues.length === 0) break;
     }
-    console.log('[TICKETS] Jira: fetched ' + allJiraIssues.length + ' issues');
+    console.log('[TICKETS] Jira: fetched ' + allJiraIssues.length + ' issues across ' + siteQueries.length + ' site(s)');
 
     var jiraTickets = allJiraIssues.map(function(issue) {
       var desc = 'No description';
@@ -1622,8 +1695,18 @@ app.post('/comment', async function(req, res) {
       var glBody = JSON.stringify({ body: comment });
       result = await httpsRequest({ hostname: 'gitlab.com', path: '/api/v4/projects/' + encodeURIComponent(projectId) + '/issues/' + issueIid + '/notes', method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(glBody) } }, glBody);
     } else {
+      // Prefer the site encoded in spaceId ("cloudId::projectKey") over the
+      // client's globally-cached cloudId, which may be stale or empty for
+      // users who didn't have a site at login. Fall back to the legacy
+      // cloudId if spaceId isn't in the new composite format.
+      var commentCloudId = spaceId ? decodeJiraSpaceId(spaceId, cloudId).cloudId : cloudId;
+      if (!commentCloudId) {
+        // Last resort: resolve accessible sites fresh from the token.
+        var commentSites = await getAccessibleJiraSites(accessToken);
+        if (commentSites.length > 0) commentCloudId = commentSites[0].cloudId;
+      }
       var jBody = JSON.stringify({ body: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: comment }] }] } });
-      result = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + cloudId + '/rest/api/3/issue/' + ticketId + '/comment', method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(jBody) } }, jBody);
+      result = await httpsRequest({ hostname: 'api.atlassian.com', path: '/ex/jira/' + commentCloudId + '/rest/api/3/issue/' + ticketId + '/comment', method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(jBody) } }, jBody);
     }
     if (result.status >= 400) return res.status(result.status).json({ error: result.data });
     res.json({ success: true });
